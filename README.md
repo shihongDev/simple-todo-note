@@ -1,6 +1,6 @@
 # Simple Todo Note
 
-Always-visible Windows desktop todo app with a minimal OpenAI/Anthropic-style UI.
+Always-visible Windows desktop todo app.
 
 ## Features
 
