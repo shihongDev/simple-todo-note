@@ -10,6 +10,10 @@ use uuid::Uuid;
 
 const MIGRATION_KEY: &str = "legacy_migration_done";
 const WINDOW_PREFS_KEY: &str = "window_prefs_json";
+const UI_PREFS_KEY: &str = "ui_prefs_json";
+const RECURRENCE_NONE: &str = "none";
+const RECURRENCE_DAILY: &str = "daily";
+const RECURRENCE_BI_WEEKLY: &str = "bi-weekly";
 
 type CommandResult<T> = Result<T, String>;
 
@@ -22,6 +26,7 @@ struct AppState {
 struct Todo {
   id: String,
   title: String,
+  recurrence_tag: String,
   note: String,
   completed: bool,
   due_date: Option<String>,
@@ -35,6 +40,7 @@ struct Todo {
 #[serde(rename_all = "camelCase")]
 struct CreateTodoInput {
   title: String,
+  recurrence_tag: Option<String>,
   note: Option<String>,
   due_date: Option<String>,
 }
@@ -44,6 +50,7 @@ struct CreateTodoInput {
 struct UpdateTodoInput {
   id: String,
   title: Option<String>,
+  recurrence_tag: Option<String>,
   note: Option<String>,
   completed: Option<bool>,
   due_date: Option<Option<String>>,
@@ -54,6 +61,8 @@ struct UpdateTodoInput {
 struct LegacyTodo {
   id: String,
   title: String,
+  #[serde(default)]
+  recurrence_tag: Option<String>,
   note: String,
   completed: bool,
   due_date: Option<String>,
@@ -76,6 +85,30 @@ enum PanelMode {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+enum MotionMode {
+  Balanced,
+  High,
+  Low,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+enum ReadabilityMode {
+  Adaptive,
+  Pure,
+  Strong,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+enum ReduceMotionOverride {
+  System,
+  On,
+  Off,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct WindowPrefs {
   x: f64,
@@ -84,6 +117,14 @@ struct WindowPrefs {
   height: f64,
   mode: PanelMode,
   always_on_top: bool,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct UiPrefs {
+  motion_mode: MotionMode,
+  readability_mode: ReadabilityMode,
+  reduce_motion_override: ReduceMotionOverride,
 }
 
 impl Default for WindowPrefs {
@@ -95,6 +136,16 @@ impl Default for WindowPrefs {
       height: 520.0,
       mode: PanelMode::Mini,
       always_on_top: true,
+    }
+  }
+}
+
+impl Default for UiPrefs {
+  fn default() -> Self {
+    Self {
+      motion_mode: MotionMode::Balanced,
+      readability_mode: ReadabilityMode::Adaptive,
+      reduce_motion_override: ReduceMotionOverride::System,
     }
   }
 }
@@ -114,6 +165,14 @@ fn normalize_date(value: Option<String>) -> Option<String> {
   })
 }
 
+fn normalize_recurrence_tag(value: Option<String>) -> String {
+  match value.as_deref().map(str::trim) {
+    Some(RECURRENCE_DAILY) => RECURRENCE_DAILY.to_string(),
+    Some(RECURRENCE_BI_WEEKLY) => RECURRENCE_BI_WEEKLY.to_string(),
+    _ => RECURRENCE_NONE.to_string(),
+  }
+}
+
 fn to_db_bool(value: bool) -> i64 {
   if value {
     1
@@ -126,12 +185,13 @@ fn map_todo_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Todo> {
   Ok(Todo {
     id: row.get(0)?,
     title: row.get(1)?,
-    note: row.get(2)?,
-    completed: row.get::<_, i64>(3)? != 0,
-    due_date: row.get(4)?,
-    created_at: row.get(5)?,
-    updated_at: row.get(6)?,
-    sort_order: row.get(7)?,
+    recurrence_tag: row.get(2)?,
+    note: row.get(3)?,
+    completed: row.get::<_, i64>(4)? != 0,
+    due_date: row.get(5)?,
+    created_at: row.get(6)?,
+    updated_at: row.get(7)?,
+    sort_order: row.get(8)?,
   })
 }
 
@@ -142,6 +202,7 @@ fn ensure_schema(conn: &Connection) -> CommandResult<()> {
       CREATE TABLE IF NOT EXISTS todos (
         id TEXT PRIMARY KEY,
         title TEXT NOT NULL,
+        recurrence_tag TEXT NOT NULL DEFAULT 'none',
         note TEXT NOT NULL DEFAULT '',
         completed INTEGER NOT NULL DEFAULT 0,
         due_date TEXT NULL,
@@ -161,13 +222,24 @@ fn ensure_schema(conn: &Connection) -> CommandResult<()> {
     )
     .map_err(|err| err.to_string())?;
 
+  if let Err(err) = conn.execute(
+    "ALTER TABLE todos ADD COLUMN recurrence_tag TEXT NOT NULL DEFAULT 'none'",
+    [],
+  ) {
+    let message = err.to_string();
+    if !message.contains("duplicate column name") {
+      return Err(message);
+    }
+  }
+
   Ok(())
 }
 
 fn get_todo_by_id(conn: &Connection, id: &str) -> CommandResult<Option<Todo>> {
   conn
     .query_row(
-      "SELECT id, title, note, completed, due_date, created_at, updated_at, sort_order FROM todos WHERE id = ?1",
+      "SELECT id, title, recurrence_tag, note, completed, due_date, created_at, updated_at, sort_order
+       FROM todos WHERE id = ?1",
       params![id],
       map_todo_row,
     )
@@ -208,6 +280,20 @@ fn get_window_prefs_from_conn(conn: &Connection) -> CommandResult<WindowPrefs> {
 fn save_window_prefs_to_conn(conn: &Connection, prefs: &WindowPrefs) -> CommandResult<()> {
   let value = serde_json::to_string(prefs).map_err(|err| err.to_string())?;
   set_meta(conn, WINDOW_PREFS_KEY, &value)
+}
+
+fn get_ui_prefs_from_conn(conn: &Connection) -> CommandResult<UiPrefs> {
+  let raw = get_meta(conn, UI_PREFS_KEY)?;
+
+  match raw {
+    Some(value) => serde_json::from_str::<UiPrefs>(&value).map_err(|err| err.to_string()),
+    None => Ok(UiPrefs::default()),
+  }
+}
+
+fn save_ui_prefs_to_conn(conn: &Connection, prefs: &UiPrefs) -> CommandResult<()> {
+  let value = serde_json::to_string(prefs).map_err(|err| err.to_string())?;
+  set_meta(conn, UI_PREFS_KEY, &value)
 }
 
 fn apply_window_prefs(window: &WebviewWindow, prefs: &WindowPrefs) -> CommandResult<()> {
@@ -302,7 +388,7 @@ fn list_todos(state: State<'_, AppState>) -> CommandResult<Vec<Todo>> {
 
   let mut statement = conn
     .prepare(
-      "SELECT id, title, note, completed, due_date, created_at, updated_at, sort_order
+      "SELECT id, title, recurrence_tag, note, completed, due_date, created_at, updated_at, sort_order
        FROM todos ORDER BY sort_order ASC, created_at DESC",
     )
     .map_err(|err| err.to_string())?;
@@ -343,6 +429,7 @@ fn create_todo(state: State<'_, AppState>, input: CreateTodoInput) -> CommandRes
   let todo = Todo {
     id: Uuid::new_v4().to_string(),
     title: trimmed_title.to_string(),
+    recurrence_tag: normalize_recurrence_tag(input.recurrence_tag),
     note: input.note.unwrap_or_default(),
     completed: false,
     due_date: normalize_date(input.due_date),
@@ -353,11 +440,13 @@ fn create_todo(state: State<'_, AppState>, input: CreateTodoInput) -> CommandRes
 
   conn
     .execute(
-      "INSERT INTO todos (id, title, note, completed, due_date, sort_order, created_at, updated_at)
-       VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+      "INSERT INTO todos
+       (id, title, recurrence_tag, note, completed, due_date, sort_order, created_at, updated_at)
+       VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
       params![
         &todo.id,
         &todo.title,
+        &todo.recurrence_tag,
         &todo.note,
         to_db_bool(todo.completed),
         &todo.due_date,
@@ -391,6 +480,10 @@ fn update_todo(state: State<'_, AppState>, input: UpdateTodoInput) -> CommandRes
     updated.title = trimmed.to_string();
   }
 
+  if let Some(recurrence_tag) = input.recurrence_tag {
+    updated.recurrence_tag = normalize_recurrence_tag(Some(recurrence_tag));
+  }
+
   if let Some(note) = input.note {
     updated.note = note;
   }
@@ -408,11 +501,12 @@ fn update_todo(state: State<'_, AppState>, input: UpdateTodoInput) -> CommandRes
   conn
     .execute(
       "UPDATE todos
-       SET title = ?2, note = ?3, completed = ?4, due_date = ?5, updated_at = ?6
+       SET title = ?2, recurrence_tag = ?3, note = ?4, completed = ?5, due_date = ?6, updated_at = ?7
        WHERE id = ?1",
       params![
         &updated.id,
         &updated.title,
+        &updated.recurrence_tag,
         &updated.note,
         to_db_bool(updated.completed),
         &updated.due_date,
@@ -536,11 +630,12 @@ fn migrate_legacy_todos_if_needed(
     let inserted = tx
       .execute(
         "INSERT OR IGNORE INTO todos
-         (id, title, note, completed, due_date, sort_order, created_at, updated_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+         (id, title, recurrence_tag, note, completed, due_date, sort_order, created_at, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
         params![
           id,
           trimmed_title,
+          normalize_recurrence_tag(legacy.recurrence_tag),
           legacy.note,
           to_db_bool(legacy.completed),
           normalize_date(legacy.due_date),
@@ -591,6 +686,26 @@ fn save_window_prefs(state: State<'_, AppState>, input: WindowPrefs) -> CommandR
     .map_err(|_| "Failed to acquire database lock".to_string())?;
 
   save_window_prefs_to_conn(&conn, &input)
+}
+
+#[tauri::command]
+fn get_ui_prefs(state: State<'_, AppState>) -> CommandResult<UiPrefs> {
+  let conn = state
+    .db
+    .lock()
+    .map_err(|_| "Failed to acquire database lock".to_string())?;
+
+  get_ui_prefs_from_conn(&conn)
+}
+
+#[tauri::command]
+fn save_ui_prefs(state: State<'_, AppState>, input: UiPrefs) -> CommandResult<()> {
+  let conn = state
+    .db
+    .lock()
+    .map_err(|_| "Failed to acquire database lock".to_string())?;
+
+  save_ui_prefs_to_conn(&conn, &input)
 }
 
 #[tauri::command]
@@ -680,6 +795,8 @@ fn main() {
       migrate_legacy_todos_if_needed,
       get_window_prefs,
       save_window_prefs,
+      get_ui_prefs,
+      save_ui_prefs,
       set_panel_mode,
       set_always_on_top,
     ])

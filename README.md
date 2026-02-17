@@ -1,14 +1,16 @@
 # Simple Todo Note
 
-Always-visible Windows desktop todo app.
+Always-visible Windows desktop todo app with an Apple-inspired liquid glass UI.
 
 ## Features
 
 - SQLite-backed local persistence (Tauri Rust backend)
 - Task CRUD (create, edit, delete) + per-task notes
+- Recurrence tag per task (`none`, `daily`, `bi-weekly`) shown as a name prefix
 - Search and filters (`all`, `open`, `done`)
 - One-time legacy migration from old `localStorage` data
 - Always-on-top panel mode (`mini` / `expanded`)
+- Appearance controls persisted to SQLite (`motion`, `readability`, `reduce motion`)
 - Auto-start registration at Windows login
 - Soft-delete with 5-second undo
 
@@ -59,6 +61,6 @@ Current identifier in `src-tauri/tauri.conf.json`:
 - `src/App.tsx`: UI, async CRUD flows, panel controls
 - `src/storage.ts`: Tauri invoke adapters + migration helpers
 - `src/types.ts`: shared frontend data contracts
-- `src/styles.css`: minimal responsive styling
+- `src/styles.css`: liquid glass styling, responsive layout, motion/readability modes
 - `src-tauri/src/main.rs`: SQLite commands, startup logic, window persistence, autostart
 - `src-tauri/tauri.conf.json`: app/build/bundle configuration

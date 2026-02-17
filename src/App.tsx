@@ -3,23 +3,96 @@ import {
   clearLegacyLocalStorage,
   createTodo as createTodoRecord,
   deleteTodo as deleteTodoRecord,
+  getUiPrefs,
   getWindowPrefs,
   listTodos,
   loadLegacyTodosFromLocalStorage,
   migrateLegacyTodosIfNeeded,
+  saveUiPrefs,
   setAlwaysOnTop as setAlwaysOnTopRecord,
   setPanelMode as setPanelModeRecord,
   toggleTodo as toggleTodoRecord,
   updateTodo as updateTodoRecord,
 } from './storage';
-import type { DeletedSnapshot, Filter, PanelMode, Todo } from './types';
+import type {
+  DeletedSnapshot,
+  Filter,
+  MotionMode,
+  PanelMode,
+  ReadabilityMode,
+  RecurrenceTag,
+  ReduceMotionOverride,
+  Todo,
+  UiPrefs,
+} from './types';
 
 type TodoPatch = {
   title?: string;
+  recurrenceTag?: RecurrenceTag;
   note?: string;
   completed?: boolean;
   dueDate?: string | null;
 };
+
+const DEFAULT_UI_PREFS: UiPrefs = {
+  motionMode: 'balanced',
+  readabilityMode: 'adaptive',
+  reduceMotionOverride: 'system',
+};
+
+function getRecurrencePrefix(tag: RecurrenceTag): string {
+  if (tag === 'daily') {
+    return '[Daily] ';
+  }
+  if (tag === 'bi-weekly') {
+    return '[Bi-weekly] ';
+  }
+  return '';
+}
+
+function getRecurrenceLabel(tag: RecurrenceTag): string {
+  if (tag === 'daily') {
+    return 'Daily';
+  }
+  if (tag === 'bi-weekly') {
+    return 'Bi-weekly';
+  }
+  return 'None';
+}
+
+function formatDisplayTitle(todo: Todo): string {
+  return `${getRecurrencePrefix(todo.recurrenceTag)}${todo.title}`;
+}
+
+function getMotionLabel(value: MotionMode): string {
+  if (value === 'high') {
+    return 'High';
+  }
+  if (value === 'low') {
+    return 'Low';
+  }
+  return 'Balanced';
+}
+
+function getReadabilityLabel(value: ReadabilityMode): string {
+  if (value === 'pure') {
+    return 'Pure glass';
+  }
+  if (value === 'strong') {
+    return 'Strong text';
+  }
+  return 'Adaptive';
+}
+
+function getReduceMotionLabel(value: ReduceMotionOverride): string {
+  if (value === 'on') {
+    return 'Always on';
+  }
+  if (value === 'off') {
+    return 'Always off';
+  }
+  return 'System';
+}
 
 function formatDateLabel(value: string | null): string {
   if (!value) {
@@ -50,6 +123,9 @@ function toErrorMessage(error: unknown): string {
 }
 
 function App() {
+  const shellRef = useRef<HTMLDivElement | null>(null);
+  const pointerFrame = useRef<number | null>(null);
+
   const [todos, setTodos] = useState<Todo[]>([]);
   const [selectedTodoId, setSelectedTodoId] = useState<string | null>(null);
   const [filter, setFilter] = useState<Filter>('all');
@@ -59,7 +135,11 @@ function App() {
   const [alwaysOnTop, setAlwaysOnTop] = useState(true);
 
   const [newTitle, setNewTitle] = useState('');
+  const [newRecurrenceTag, setNewRecurrenceTag] = useState<RecurrenceTag>('none');
   const [newDueDate, setNewDueDate] = useState('');
+
+  const [uiPrefs, setUiPrefs] = useState<UiPrefs>(DEFAULT_UI_PREFS);
+  const [systemPrefersReducedMotion, setSystemPrefersReducedMotion] = useState(false);
 
   const [detailTitle, setDetailTitle] = useState('');
   const [detailNote, setDetailNote] = useState('');
@@ -72,6 +152,9 @@ function App() {
 
   const selectedTodo = todos.find((todo) => todo.id === selectedTodoId) ?? null;
   const openCount = todos.filter((todo) => !todo.completed).length;
+  const effectiveReducedMotion =
+    uiPrefs.reduceMotionOverride === 'on' ||
+    (uiPrefs.reduceMotionOverride === 'system' && systemPrefersReducedMotion);
 
   const filteredTodos = useMemo(() => {
     const needle = search.trim().toLowerCase();
@@ -91,11 +174,96 @@ function App() {
 
       return (
         todo.title.toLowerCase().includes(needle) ||
+        getRecurrenceLabel(todo.recurrenceTag).toLowerCase().includes(needle) ||
         todo.note.toLowerCase().includes(needle) ||
         (todo.dueDate ?? '').toLowerCase().includes(needle)
       );
     });
   }, [filter, search, todos]);
+
+  useEffect(() => {
+    const media = window.matchMedia('(prefers-reduced-motion: reduce)');
+    setSystemPrefersReducedMotion(media.matches);
+
+    const onChange = (event: MediaQueryListEvent) => {
+      setSystemPrefersReducedMotion(event.matches);
+    };
+
+    media.addEventListener('change', onChange);
+    return () => {
+      media.removeEventListener('change', onChange);
+    };
+  }, []);
+
+  useEffect(() => {
+    const shell = shellRef.current;
+    if (!shell) {
+      return;
+    }
+
+    const maxTiltDegrees =
+      uiPrefs.motionMode === 'high' ? 4.2 : uiPrefs.motionMode === 'low' ? 1.2 : 2.4;
+
+    const commitPointer = (x: number, y: number) => {
+      shell.style.setProperty('--cursor-x', `${(x * 100).toFixed(2)}%`);
+      shell.style.setProperty('--cursor-y', `${(y * 100).toFixed(2)}%`);
+
+      if (effectiveReducedMotion) {
+        shell.style.setProperty('--tilt-x', '0deg');
+        shell.style.setProperty('--tilt-y', '0deg');
+        return;
+      }
+
+      const tiltX = (0.5 - y) * maxTiltDegrees * 2;
+      const tiltY = (x - 0.5) * maxTiltDegrees * 2;
+      shell.style.setProperty('--tilt-x', `${tiltX.toFixed(3)}deg`);
+      shell.style.setProperty('--tilt-y', `${tiltY.toFixed(3)}deg`);
+    };
+
+    let nextX = 0.5;
+    let nextY = 0.5;
+
+    const queueCommit = () => {
+      if (pointerFrame.current !== null) {
+        return;
+      }
+
+      pointerFrame.current = window.requestAnimationFrame(() => {
+        pointerFrame.current = null;
+        commitPointer(nextX, nextY);
+      });
+    };
+
+    const onPointerMove = (event: PointerEvent) => {
+      const bounds = shell.getBoundingClientRect();
+      if (bounds.width <= 0 || bounds.height <= 0) {
+        return;
+      }
+
+      nextX = Math.min(Math.max((event.clientX - bounds.left) / bounds.width, 0), 1);
+      nextY = Math.min(Math.max((event.clientY - bounds.top) / bounds.height, 0), 1);
+      queueCommit();
+    };
+
+    const onPointerLeave = () => {
+      nextX = 0.5;
+      nextY = 0.5;
+      queueCommit();
+    };
+
+    shell.addEventListener('pointermove', onPointerMove);
+    shell.addEventListener('pointerleave', onPointerLeave);
+    commitPointer(0.5, 0.5);
+
+    return () => {
+      shell.removeEventListener('pointermove', onPointerMove);
+      shell.removeEventListener('pointerleave', onPointerLeave);
+      if (pointerFrame.current !== null) {
+        window.cancelAnimationFrame(pointerFrame.current);
+        pointerFrame.current = null;
+      }
+    };
+  }, [effectiveReducedMotion, uiPrefs.motionMode]);
 
   useEffect(() => {
     let active = true;
@@ -109,7 +277,11 @@ function App() {
           clearLegacyLocalStorage();
         }
 
-        const [initialTodos, prefs] = await Promise.all([listTodos(), getWindowPrefs()]);
+        const [initialTodos, prefs, nextUiPrefs] = await Promise.all([
+          listTodos(),
+          getWindowPrefs(),
+          getUiPrefs(),
+        ]);
 
         if (!active) {
           return;
@@ -119,6 +291,7 @@ function App() {
         setSelectedTodoId(initialTodos[0]?.id ?? null);
         setPanelMode(prefs.mode);
         setAlwaysOnTop(prefs.alwaysOnTop);
+        setUiPrefs(nextUiPrefs);
       } catch (error) {
         if (active) {
           setErrorMessage(toErrorMessage(error));
@@ -196,12 +369,14 @@ function App() {
     try {
       const created = await createTodoRecord({
         title,
+        recurrenceTag: newRecurrenceTag,
         dueDate: newDueDate || null,
       });
 
       setTodos((previous) => [created, ...previous]);
       setSelectedTodoId(created.id);
       setNewTitle('');
+      setNewRecurrenceTag('none');
       setNewDueDate('');
       setErrorMessage(null);
     } catch (error) {
@@ -226,6 +401,7 @@ function App() {
     const payload: {
       id: string;
       title?: string;
+      recurrenceTag?: RecurrenceTag;
       note?: string;
       completed?: boolean;
       dueDate?: string | null;
@@ -237,6 +413,10 @@ function App() {
 
     if ('note' in patch) {
       payload.note = patch.note;
+    }
+
+    if ('recurrenceTag' in patch) {
+      payload.recurrenceTag = patch.recurrenceTag;
     }
 
     if ('completed' in patch) {
@@ -342,6 +522,24 @@ function App() {
     setDeletedSnapshot(null);
   }
 
+  async function applyUiPrefsPatch(patch: Partial<UiPrefs>) {
+    const previous = uiPrefs;
+    const next: UiPrefs = {
+      ...previous,
+      ...patch,
+    };
+
+    setUiPrefs(next);
+
+    try {
+      await saveUiPrefs(next);
+      setErrorMessage(null);
+    } catch (error) {
+      setUiPrefs(previous);
+      setErrorMessage(toErrorMessage(error));
+    }
+  }
+
   async function switchPanelMode(nextMode: PanelMode) {
     if (nextMode === panelMode) {
       return;
@@ -384,7 +582,13 @@ function App() {
   }
 
   return (
-    <div className={`app-shell ${panelMode}`}>
+    <div
+      ref={shellRef}
+      className={`app-shell ${panelMode}`}
+      data-motion={uiPrefs.motionMode}
+      data-readability={uiPrefs.readabilityMode}
+      data-reduce-motion={effectiveReducedMotion ? 'true' : 'false'}
+    >
       <header className="top-bar">
         <div>
           <p className="eyebrow">Simple Todo Note</p>
@@ -418,6 +622,15 @@ function App() {
             aria-label="Task title"
             maxLength={160}
           />
+          <select
+            value={newRecurrenceTag}
+            onChange={(event) => setNewRecurrenceTag(event.target.value as RecurrenceTag)}
+            aria-label="Task recurrence tag"
+          >
+            <option value="none">No tag</option>
+            <option value="daily">Daily</option>
+            <option value="bi-weekly">Bi-weekly</option>
+          </select>
           <input
             type="date"
             value={newDueDate}
@@ -471,10 +684,10 @@ function App() {
                     checked={todo.completed}
                     onChange={() => void toggleTodo(todo.id)}
                     onClick={(event) => event.stopPropagation()}
-                    aria-label={`Mark ${todo.title} as ${todo.completed ? 'open' : 'done'}`}
+                    aria-label={`Mark ${formatDisplayTitle(todo)} as ${todo.completed ? 'open' : 'done'}`}
                   />
                   <div>
-                    <p className={todo.completed ? 'done' : ''}>{todo.title}</p>
+                    <p className={todo.completed ? 'done' : ''}>{formatDisplayTitle(todo)}</p>
                     <span>{formatDateLabel(todo.dueDate)}</span>
                   </div>
                 </div>
@@ -502,6 +715,23 @@ function App() {
                 </div>
 
                 <div className="field-row">
+                  <label htmlFor="recurrence-tag">Tag</label>
+                  <select
+                    id="recurrence-tag"
+                    value={selectedTodo.recurrenceTag}
+                    onChange={(event) =>
+                      void applyTodoPatch(selectedTodo.id, {
+                        recurrenceTag: event.target.value as RecurrenceTag,
+                      })
+                    }
+                  >
+                    <option value="none">No tag</option>
+                    <option value="daily">Daily</option>
+                    <option value="bi-weekly">Bi-weekly</option>
+                  </select>
+                </div>
+
+                <div className="field-row">
                   <label htmlFor="due-date">Due date</label>
                   <input
                     id="due-date"
@@ -521,6 +751,58 @@ function App() {
                     {selectedTodo.completed ? 'Done' : 'Open'}
                   </button>
                 </div>
+
+                <section className="appearance-panel" aria-label="Appearance settings">
+                  <p className="appearance-title">Appearance</p>
+                  <div className="field-row">
+                    <label htmlFor="motion-mode">Motion</label>
+                    <select
+                      id="motion-mode"
+                      value={uiPrefs.motionMode}
+                      onChange={(event) =>
+                        void applyUiPrefsPatch({
+                          motionMode: event.target.value as MotionMode,
+                        })
+                      }
+                    >
+                      <option value="balanced">{getMotionLabel('balanced')}</option>
+                      <option value="high">{getMotionLabel('high')}</option>
+                      <option value="low">{getMotionLabel('low')}</option>
+                    </select>
+                  </div>
+                  <div className="field-row">
+                    <label htmlFor="readability-mode">Readability</label>
+                    <select
+                      id="readability-mode"
+                      value={uiPrefs.readabilityMode}
+                      onChange={(event) =>
+                        void applyUiPrefsPatch({
+                          readabilityMode: event.target.value as ReadabilityMode,
+                        })
+                      }
+                    >
+                      <option value="adaptive">{getReadabilityLabel('adaptive')}</option>
+                      <option value="pure">{getReadabilityLabel('pure')}</option>
+                      <option value="strong">{getReadabilityLabel('strong')}</option>
+                    </select>
+                  </div>
+                  <div className="field-row">
+                    <label htmlFor="reduce-motion-mode">Reduce motion</label>
+                    <select
+                      id="reduce-motion-mode"
+                      value={uiPrefs.reduceMotionOverride}
+                      onChange={(event) =>
+                        void applyUiPrefsPatch({
+                          reduceMotionOverride: event.target.value as ReduceMotionOverride,
+                        })
+                      }
+                    >
+                      <option value="system">{getReduceMotionLabel('system')}</option>
+                      <option value="on">{getReduceMotionLabel('on')}</option>
+                      <option value="off">{getReduceMotionLabel('off')}</option>
+                    </select>
+                  </div>
+                </section>
 
                 <label htmlFor="note-editor" className="note-label">
                   Note

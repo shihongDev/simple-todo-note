@@ -1,10 +1,16 @@
 export type Filter = 'all' | 'open' | 'done';
 
 export type PanelMode = 'mini' | 'expanded';
+export type MotionMode = 'balanced' | 'high' | 'low';
+export type ReadabilityMode = 'adaptive' | 'pure' | 'strong';
+export type ReduceMotionOverride = 'system' | 'on' | 'off';
+
+export type RecurrenceTag = 'none' | 'daily' | 'bi-weekly';
 
 export type Todo = {
   id: string;
   title: string;
+  recurrenceTag: RecurrenceTag;
   note: string;
   completed: boolean;
   dueDate: string | null;
@@ -12,10 +18,13 @@ export type Todo = {
   updatedAt: string;
 };
 
-export type LegacyTodo = Todo;
+export type LegacyTodo = Omit<Todo, 'recurrenceTag'> & {
+  recurrenceTag?: RecurrenceTag;
+};
 
 export type CreateTodoInput = {
   title: string;
+  recurrenceTag?: RecurrenceTag;
   note?: string;
   dueDate?: string | null;
 };
@@ -23,6 +32,7 @@ export type CreateTodoInput = {
 export type UpdateTodoInput = {
   id: string;
   title?: string;
+  recurrenceTag?: RecurrenceTag;
   note?: string;
   completed?: boolean;
   dueDate?: string | null;
@@ -40,6 +50,12 @@ export type WindowPrefs = {
   height: number;
   mode: PanelMode;
   alwaysOnTop: boolean;
+};
+
+export type UiPrefs = {
+  motionMode: MotionMode;
+  readabilityMode: ReadabilityMode;
+  reduceMotionOverride: ReduceMotionOverride;
 };
 
 export type DeletedSnapshot = {

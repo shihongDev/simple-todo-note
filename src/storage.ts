@@ -3,7 +3,9 @@ import type {
   LegacyTodo,
   MigrationResult,
   PanelMode,
+  RecurrenceTag,
   Todo,
+  UiPrefs,
   UpdateTodoInput,
   WindowPrefs,
 } from './types';
@@ -24,12 +26,16 @@ type TauriRuntime = {
   };
 };
 
-function isTodoLike(value: unknown): value is Todo {
+function isRecurrenceTag(value: unknown): value is RecurrenceTag {
+  return value === 'none' || value === 'daily' || value === 'bi-weekly';
+}
+
+function isLegacyTodoLike(value: unknown): value is LegacyTodo {
   if (!value || typeof value !== 'object') {
     return false;
   }
 
-  const todo = value as Partial<Todo>;
+  const todo = value as Partial<LegacyTodo>;
 
   return (
     typeof todo.id === 'string' &&
@@ -38,7 +44,8 @@ function isTodoLike(value: unknown): value is Todo {
     typeof todo.completed === 'boolean' &&
     (typeof todo.dueDate === 'string' || todo.dueDate === null) &&
     typeof todo.createdAt === 'string' &&
-    typeof todo.updatedAt === 'string'
+    typeof todo.updatedAt === 'string' &&
+    (todo.recurrenceTag === undefined || isRecurrenceTag(todo.recurrenceTag))
   );
 }
 
@@ -78,7 +85,10 @@ export function loadLegacyTodosFromLocalStorage(): LegacyTodo[] {
       return [];
     }
 
-    return parsed.filter(isTodoLike);
+    return parsed.filter(isLegacyTodoLike).map((todo) => ({
+      ...todo,
+      recurrenceTag: todo.recurrenceTag ?? 'none',
+    }));
   } catch {
     return [];
   }
@@ -131,4 +141,12 @@ export async function setPanelMode(mode: PanelMode): Promise<WindowPrefs> {
 
 export async function setAlwaysOnTop(enabled: boolean): Promise<WindowPrefs> {
   return invokeCommand<WindowPrefs>('set_always_on_top', { enabled });
+}
+
+export async function getUiPrefs(): Promise<UiPrefs> {
+  return invokeCommand<UiPrefs>('get_ui_prefs');
+}
+
+export async function saveUiPrefs(input: UiPrefs): Promise<void> {
+  await invokeCommand('save_ui_prefs', { input });
 }
