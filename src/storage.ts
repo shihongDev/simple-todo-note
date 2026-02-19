@@ -27,7 +27,7 @@ type TauriRuntime = {
 };
 
 function isRecurrenceTag(value: unknown): value is RecurrenceTag {
-  return value === 'none' || value === 'daily' || value === 'bi-weekly';
+  return value === 'none' || value === 'daily' || value === 'weekly' || value === 'bi-weekly';
 }
 
 function isLegacyTodoLike(value: unknown): value is LegacyTodo {
@@ -117,6 +117,10 @@ export async function updateTodo(input: UpdateTodoInput): Promise<Todo> {
 
 export async function toggleTodo(id: string): Promise<Todo> {
   return invokeCommand<Todo>('toggle_todo', { id });
+}
+
+export async function setRecurrenceCheck(id: string, checked: boolean): Promise<Todo> {
+  return invokeCommand<Todo>('set_recurrence_check', { id, checked });
 }
 
 export async function deleteTodo(id: string): Promise<void> {

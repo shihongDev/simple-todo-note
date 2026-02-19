@@ -13,6 +13,7 @@ const WINDOW_PREFS_KEY: &str = "window_prefs_json";
 const UI_PREFS_KEY: &str = "ui_prefs_json";
 const RECURRENCE_NONE: &str = "none";
 const RECURRENCE_DAILY: &str = "daily";
+const RECURRENCE_WEEKLY: &str = "weekly";
 const RECURRENCE_BI_WEEKLY: &str = "bi-weekly";
 
 type CommandResult<T> = Result<T, String>;
@@ -27,6 +28,7 @@ struct Todo {
   id: String,
   title: String,
   recurrence_tag: String,
+  recurrence_checked_at: Option<String>,
   note: String,
   completed: bool,
   due_date: Option<String>,
@@ -168,6 +170,7 @@ fn normalize_date(value: Option<String>) -> Option<String> {
 fn normalize_recurrence_tag(value: Option<String>) -> String {
   match value.as_deref().map(str::trim) {
     Some(RECURRENCE_DAILY) => RECURRENCE_DAILY.to_string(),
+    Some(RECURRENCE_WEEKLY) => RECURRENCE_WEEKLY.to_string(),
     Some(RECURRENCE_BI_WEEKLY) => RECURRENCE_BI_WEEKLY.to_string(),
     _ => RECURRENCE_NONE.to_string(),
   }
@@ -186,12 +189,13 @@ fn map_todo_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Todo> {
     id: row.get(0)?,
     title: row.get(1)?,
     recurrence_tag: row.get(2)?,
-    note: row.get(3)?,
-    completed: row.get::<_, i64>(4)? != 0,
-    due_date: row.get(5)?,
-    created_at: row.get(6)?,
-    updated_at: row.get(7)?,
-    sort_order: row.get(8)?,
+    recurrence_checked_at: row.get(3)?,
+    note: row.get(4)?,
+    completed: row.get::<_, i64>(5)? != 0,
+    due_date: row.get(6)?,
+    created_at: row.get(7)?,
+    updated_at: row.get(8)?,
+    sort_order: row.get(9)?,
   })
 }
 
@@ -203,6 +207,7 @@ fn ensure_schema(conn: &Connection) -> CommandResult<()> {
         id TEXT PRIMARY KEY,
         title TEXT NOT NULL,
         recurrence_tag TEXT NOT NULL DEFAULT 'none',
+        recurrence_checked_at TEXT NULL,
         note TEXT NOT NULL DEFAULT '',
         completed INTEGER NOT NULL DEFAULT 0,
         due_date TEXT NULL,
@@ -232,13 +237,20 @@ fn ensure_schema(conn: &Connection) -> CommandResult<()> {
     }
   }
 
+  if let Err(err) = conn.execute("ALTER TABLE todos ADD COLUMN recurrence_checked_at TEXT NULL", []) {
+    let message = err.to_string();
+    if !message.contains("duplicate column name") {
+      return Err(message);
+    }
+  }
+
   Ok(())
 }
 
 fn get_todo_by_id(conn: &Connection, id: &str) -> CommandResult<Option<Todo>> {
   conn
     .query_row(
-      "SELECT id, title, recurrence_tag, note, completed, due_date, created_at, updated_at, sort_order
+      "SELECT id, title, recurrence_tag, recurrence_checked_at, note, completed, due_date, created_at, updated_at, sort_order
        FROM todos WHERE id = ?1",
       params![id],
       map_todo_row,
@@ -388,7 +400,7 @@ fn list_todos(state: State<'_, AppState>) -> CommandResult<Vec<Todo>> {
 
   let mut statement = conn
     .prepare(
-      "SELECT id, title, recurrence_tag, note, completed, due_date, created_at, updated_at, sort_order
+      "SELECT id, title, recurrence_tag, recurrence_checked_at, note, completed, due_date, created_at, updated_at, sort_order
        FROM todos ORDER BY sort_order ASC, created_at DESC",
     )
     .map_err(|err| err.to_string())?;
@@ -430,6 +442,7 @@ fn create_todo(state: State<'_, AppState>, input: CreateTodoInput) -> CommandRes
     id: Uuid::new_v4().to_string(),
     title: trimmed_title.to_string(),
     recurrence_tag: normalize_recurrence_tag(input.recurrence_tag),
+    recurrence_checked_at: None,
     note: input.note.unwrap_or_default(),
     completed: false,
     due_date: normalize_date(input.due_date),
@@ -441,12 +454,13 @@ fn create_todo(state: State<'_, AppState>, input: CreateTodoInput) -> CommandRes
   conn
     .execute(
       "INSERT INTO todos
-       (id, title, recurrence_tag, note, completed, due_date, sort_order, created_at, updated_at)
-       VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+       (id, title, recurrence_tag, recurrence_checked_at, note, completed, due_date, sort_order, created_at, updated_at)
+       VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
       params![
         &todo.id,
         &todo.title,
         &todo.recurrence_tag,
+        &todo.recurrence_checked_at,
         &todo.note,
         to_db_bool(todo.completed),
         &todo.due_date,
@@ -533,6 +547,32 @@ fn toggle_todo(state: State<'_, AppState>, id: String) -> CommandResult<Todo> {
     .execute(
       "UPDATE todos SET completed = ?2, updated_at = ?3 WHERE id = ?1",
       params![&target.id, to_db_bool(target.completed), &target.updated_at],
+    )
+    .map_err(|err| err.to_string())?;
+
+  Ok(target)
+}
+
+#[tauri::command]
+fn set_recurrence_check(state: State<'_, AppState>, id: String, checked: bool) -> CommandResult<Todo> {
+  let conn = state
+    .db
+    .lock()
+    .map_err(|_| "Failed to acquire database lock".to_string())?;
+
+  let mut target = get_todo_by_id(&conn, &id)?.ok_or_else(|| format!("Todo not found: {id}"))?;
+
+  if target.recurrence_tag == RECURRENCE_NONE {
+    return Err("Recurrence check is only available for recurring tasks".to_string());
+  }
+
+  target.recurrence_checked_at = if checked { Some(now_iso()) } else { None };
+  target.updated_at = now_iso();
+
+  conn
+    .execute(
+      "UPDATE todos SET recurrence_checked_at = ?2, updated_at = ?3 WHERE id = ?1",
+      params![&target.id, &target.recurrence_checked_at, &target.updated_at],
     )
     .map_err(|err| err.to_string())?;
 
@@ -630,12 +670,13 @@ fn migrate_legacy_todos_if_needed(
     let inserted = tx
       .execute(
         "INSERT OR IGNORE INTO todos
-         (id, title, recurrence_tag, note, completed, due_date, sort_order, created_at, updated_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+         (id, title, recurrence_tag, recurrence_checked_at, note, completed, due_date, sort_order, created_at, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
         params![
           id,
           trimmed_title,
           normalize_recurrence_tag(legacy.recurrence_tag),
+          Option::<String>::None,
           legacy.note,
           to_db_bool(legacy.completed),
           normalize_date(legacy.due_date),
@@ -790,6 +831,7 @@ fn main() {
       create_todo,
       update_todo,
       toggle_todo,
+      set_recurrence_check,
       delete_todo,
       reorder_todos,
       migrate_legacy_todos_if_needed,

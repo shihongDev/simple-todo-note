@@ -312,9 +312,32 @@ h1 {
 
 .create-form {
   display: grid;
-  grid-template-columns: 1fr auto auto auto;
-  gap: 10px;
-  padding: 12px;
+  grid-template-columns: 1fr 120px;
+  grid-template-areas:
+    'title submit'
+    'tag date';
+  gap: 8px;
+  padding: 10px;
+}
+
+.create-title {
+  grid-area: title;
+  min-width: 0;
+}
+
+.create-tag {
+  grid-area: tag;
+  min-width: 0;
+}
+
+.create-date {
+  grid-area: date;
+  min-width: 0;
+}
+
+.create-submit {
+  grid-area: submit;
+  min-width: 84px;
 }
 
 input,
@@ -458,6 +481,32 @@ button.pin-active {
   gap: 10px;
 }
 
+.toolbar-head {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 8px;
+  align-items: center;
+}
+
+.toolbar-head input {
+  width: 100%;
+}
+
+.add-toggle.active {
+  border-color: rgba(28, 46, 75, 0.62);
+  color: #f5f8ff;
+  background: var(--accent-fill);
+}
+
+.add-popover {
+  border: 1px solid var(--surface-border-soft);
+  border-radius: 14px;
+  background: rgba(var(--glass-fill-rgb), 0.28);
+  backdrop-filter: blur(16px) saturate(172%);
+  -webkit-backdrop-filter: blur(16px) saturate(172%);
+  overflow: hidden;
+}
+
 .filters {
   display: inline-flex;
   gap: 2px;
@@ -566,9 +615,20 @@ button.pin-active {
   color: var(--text-soft);
 }
 
+.todo-item p.cycle-complete {
+  color: #2f4467;
+}
+
 .todo-item span {
+  display: block;
   font-size: 12px;
   color: var(--text-soft);
+}
+
+.recurrence-state {
+  margin-top: 2px;
+  font-weight: 600;
+  color: #3b5278;
 }
 
 .empty-state {
@@ -602,6 +662,19 @@ button.pin-active {
   grid-template-columns: 92px 1fr;
   align-items: center;
   gap: 10px;
+}
+
+.status-cell {
+  display: grid;
+  justify-items: start;
+  gap: 6px;
+}
+
+.status-hint {
+  margin: 0;
+  font-size: 12px;
+  line-height: 1.35;
+  color: var(--text-soft);
 }
 
 .field-row label,
@@ -689,6 +762,11 @@ textarea {
 
   .create-form {
     grid-template-columns: 1fr;
+    grid-template-areas:
+      'title'
+      'tag'
+      'date'
+      'submit';
   }
 
   .workspace {

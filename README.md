@@ -6,7 +6,9 @@ Always-visible Windows desktop todo app with an Apple-inspired liquid glass UI.
 
 - SQLite-backed local persistence (Tauri Rust backend)
 - Task CRUD (create, edit, delete) + per-task notes
-- Recurrence tag per task (`none`, `daily`, `bi-weekly`) shown as a name prefix
+- Recurrence tag per task (`none`, `daily`, `weekly`, `bi-weekly`) shown as a name prefix
+- Recurring checkbox behavior: marks the current cycle complete while keeping the task in `open`
+- Explicit status control to move any task to `done` / `open`
 - Search and filters (`all`, `open`, `done`)
 - One-time legacy migration from old `localStorage` data
 - Always-on-top panel mode (`mini` / `expanded`)

@@ -5,12 +5,13 @@ export type MotionMode = 'balanced' | 'high' | 'low';
 export type ReadabilityMode = 'adaptive' | 'pure' | 'strong';
 export type ReduceMotionOverride = 'system' | 'on' | 'off';
 
-export type RecurrenceTag = 'none' | 'daily' | 'bi-weekly';
+export type RecurrenceTag = 'none' | 'daily' | 'weekly' | 'bi-weekly';
 
 export type Todo = {
   id: string;
   title: string;
   recurrenceTag: RecurrenceTag;
+  recurrenceCheckedAt: string | null;
   note: string;
   completed: boolean;
   dueDate: string | null;
@@ -18,8 +19,9 @@ export type Todo = {
   updatedAt: string;
 };
 
-export type LegacyTodo = Omit<Todo, 'recurrenceTag'> & {
+export type LegacyTodo = Omit<Todo, 'recurrenceTag' | 'recurrenceCheckedAt'> & {
   recurrenceTag?: RecurrenceTag;
+  recurrenceCheckedAt?: string | null;
 };
 
 export type CreateTodoInput = {

@@ -9,6 +9,7 @@ import {
   loadLegacyTodosFromLocalStorage,
   migrateLegacyTodosIfNeeded,
   saveUiPrefs,
+  setRecurrenceCheck as setRecurrenceCheckRecord,
   setAlwaysOnTop as setAlwaysOnTopRecord,
   setPanelMode as setPanelModeRecord,
   toggleTodo as toggleTodoRecord,
@@ -29,6 +30,7 @@ import type {
 type TodoPatch = {
   title?: string;
   recurrenceTag?: RecurrenceTag;
+  recurrenceCheckedAt?: string | null;
   note?: string;
   completed?: boolean;
   dueDate?: string | null;
@@ -44,6 +46,9 @@ function getRecurrencePrefix(tag: RecurrenceTag): string {
   if (tag === 'daily') {
     return '[Daily] ';
   }
+  if (tag === 'weekly') {
+    return '[Weekly] ';
+  }
   if (tag === 'bi-weekly') {
     return '[Bi-weekly] ';
   }
@@ -54,10 +59,65 @@ function getRecurrenceLabel(tag: RecurrenceTag): string {
   if (tag === 'daily') {
     return 'Daily';
   }
+  if (tag === 'weekly') {
+    return 'Weekly';
+  }
   if (tag === 'bi-weekly') {
     return 'Bi-weekly';
   }
   return 'None';
+}
+
+function isRecurringTag(tag: RecurrenceTag): boolean {
+  return tag !== 'none';
+}
+
+function isSameLocalDay(left: Date, right: Date): boolean {
+  return (
+    left.getFullYear() === right.getFullYear() &&
+    left.getMonth() === right.getMonth() &&
+    left.getDate() === right.getDate()
+  );
+}
+
+function isRecurringCycleChecked(todo: Todo, now: Date = new Date()): boolean {
+  if (todo.completed) {
+    return true;
+  }
+
+  if (!isRecurringTag(todo.recurrenceTag)) {
+    return todo.completed;
+  }
+
+  if (!todo.recurrenceCheckedAt) {
+    return false;
+  }
+
+  const checkedAt = new Date(todo.recurrenceCheckedAt);
+  if (Number.isNaN(checkedAt.getTime())) {
+    return false;
+  }
+
+  if (todo.recurrenceTag === 'daily') {
+    return isSameLocalDay(checkedAt, now);
+  }
+
+  const elapsedMs = now.getTime() - checkedAt.getTime();
+  const cycleDays = todo.recurrenceTag === 'weekly' ? 7 : 14;
+  return elapsedMs < cycleDays * 24 * 60 * 60 * 1000;
+}
+
+function getCycleStatusLabel(tag: RecurrenceTag): string {
+  if (tag === 'daily') {
+    return 'Done today';
+  }
+  if (tag === 'weekly') {
+    return 'Done this week';
+  }
+  if (tag === 'bi-weekly') {
+    return 'Done this cycle';
+  }
+  return '';
 }
 
 function formatDisplayTitle(todo: Todo): string {
@@ -92,6 +152,13 @@ function getReduceMotionLabel(value: ReduceMotionOverride): string {
     return 'Always off';
   }
   return 'System';
+}
+
+function getStatusButtonLabel(todo: Todo): string {
+  if (todo.completed) {
+    return 'Move to Open';
+  }
+  return 'Move to Done';
 }
 
 function formatDateLabel(value: string | null): string {
@@ -137,6 +204,7 @@ function App() {
   const [newTitle, setNewTitle] = useState('');
   const [newRecurrenceTag, setNewRecurrenceTag] = useState<RecurrenceTag>('none');
   const [newDueDate, setNewDueDate] = useState('');
+  const [isAddOpen, setIsAddOpen] = useState(false);
 
   const [uiPrefs, setUiPrefs] = useState<UiPrefs>(DEFAULT_UI_PREFS);
   const [systemPrefersReducedMotion, setSystemPrefersReducedMotion] = useState(false);
@@ -378,6 +446,7 @@ function App() {
       setNewTitle('');
       setNewRecurrenceTag('none');
       setNewDueDate('');
+      setIsAddOpen(false);
       setErrorMessage(null);
     } catch (error) {
       setErrorMessage(toErrorMessage(error));
@@ -457,6 +526,40 @@ function App() {
       setErrorMessage(toErrorMessage(error));
       await refreshTodos(todoId);
     }
+  }
+
+  async function setRecurringCycleCheck(todoId: string, checked: boolean) {
+    const target = todos.find((todo) => todo.id === todoId);
+    if (!target || !isRecurringTag(target.recurrenceTag)) {
+      return;
+    }
+
+    const optimistic: Todo = {
+      ...target,
+      recurrenceCheckedAt: checked ? new Date().toISOString() : null,
+      updatedAt: new Date().toISOString(),
+    };
+
+    setTodos((previous) => previous.map((todo) => (todo.id === todoId ? optimistic : todo)));
+
+    try {
+      const updated = await setRecurrenceCheckRecord(todoId, checked);
+      setTodos((previous) => previous.map((todo) => (todo.id === todoId ? updated : todo)));
+      setErrorMessage(null);
+    } catch (error) {
+      setErrorMessage(toErrorMessage(error));
+      await refreshTodos(todoId);
+    }
+  }
+
+  async function handleChecklistToggle(todo: Todo) {
+    if (!isRecurringTag(todo.recurrenceTag) || todo.completed) {
+      await toggleTodo(todo.id);
+      return;
+    }
+
+    const checked = isRecurringCycleChecked(todo);
+    await setRecurringCycleCheck(todo.id, !checked);
   }
 
   async function finalizeDelete(todoId: string) {
@@ -613,43 +716,64 @@ function App() {
       {errorMessage && <p className="error-banner">{errorMessage}</p>}
       {loading && <p className="loading-banner">Loading tasks...</p>}
 
-      <section className="create-card">
-        <form onSubmit={addTodo} className="create-form">
-          <input
-            value={newTitle}
-            onChange={(event) => setNewTitle(event.target.value)}
-            placeholder="Add a task..."
-            aria-label="Task title"
-            maxLength={160}
-          />
-          <select
-            value={newRecurrenceTag}
-            onChange={(event) => setNewRecurrenceTag(event.target.value as RecurrenceTag)}
-            aria-label="Task recurrence tag"
-          >
-            <option value="none">No tag</option>
-            <option value="daily">Daily</option>
-            <option value="bi-weekly">Bi-weekly</option>
-          </select>
-          <input
-            type="date"
-            value={newDueDate}
-            onChange={(event) => setNewDueDate(event.target.value)}
-            aria-label="Due date"
-          />
-          <button type="submit">New</button>
-        </form>
-      </section>
-
       <section className="workspace">
         <aside className="list-panel">
           <div className="toolbar">
-            <input
-              value={search}
-              onChange={(event) => setSearch(event.target.value)}
-              placeholder="Search"
-              aria-label="Search tasks"
-            />
+            <div className="toolbar-head">
+              <input
+                value={search}
+                onChange={(event) => setSearch(event.target.value)}
+                placeholder="Search"
+                aria-label="Search tasks"
+              />
+              <button
+                type="button"
+                className={`add-toggle ${isAddOpen ? 'active' : ''}`}
+                onClick={() => setIsAddOpen((current) => !current)}
+                aria-expanded={isAddOpen}
+                aria-controls="add-task-panel"
+              >
+                {isAddOpen ? 'Close' : 'Add'}
+              </button>
+            </div>
+
+            {isAddOpen && (
+              <section className="add-popover" id="add-task-panel" aria-label="Create task">
+                <form onSubmit={addTodo} className="create-form">
+                  <input
+                    className="create-title"
+                    value={newTitle}
+                    onChange={(event) => setNewTitle(event.target.value)}
+                    placeholder="Add a task..."
+                    aria-label="Task title"
+                    maxLength={160}
+                    autoFocus
+                  />
+                  <select
+                    className="create-tag"
+                    value={newRecurrenceTag}
+                    onChange={(event) => setNewRecurrenceTag(event.target.value as RecurrenceTag)}
+                    aria-label="Task recurrence tag"
+                  >
+                    <option value="none">No tag</option>
+                    <option value="daily">Daily</option>
+                    <option value="weekly">Weekly</option>
+                    <option value="bi-weekly">Bi-weekly</option>
+                  </select>
+                  <input
+                    className="create-date"
+                    type="date"
+                    value={newDueDate}
+                    onChange={(event) => setNewDueDate(event.target.value)}
+                    aria-label="Due date"
+                  />
+                  <button className="create-submit" type="submit">
+                    Create
+                  </button>
+                </form>
+              </section>
+            )}
+
             <div className="filters" role="tablist" aria-label="Task filters">
               {(['all', 'open', 'done'] as const).map((option) => (
                 <button
@@ -665,34 +789,50 @@ function App() {
           </div>
 
           <ul className="todo-list">
-            {filteredTodos.map((todo) => (
-              <li key={todo.id}>
-                <div
-                  role="button"
-                  tabIndex={0}
-                  className={`todo-item ${selectedTodoId === todo.id ? 'selected' : ''}`}
-                  onClick={() => handleTodoSelect(todo.id)}
-                  onKeyDown={(event) => {
-                    if (event.key === 'Enter' || event.key === ' ') {
-                      event.preventDefault();
-                      handleTodoSelect(todo.id);
-                    }
-                  }}
-                >
-                  <input
-                    type="checkbox"
-                    checked={todo.completed}
-                    onChange={() => void toggleTodo(todo.id)}
-                    onClick={(event) => event.stopPropagation()}
-                    aria-label={`Mark ${formatDisplayTitle(todo)} as ${todo.completed ? 'open' : 'done'}`}
-                  />
-                  <div>
-                    <p className={todo.completed ? 'done' : ''}>{formatDisplayTitle(todo)}</p>
-                    <span>{formatDateLabel(todo.dueDate)}</span>
+            {filteredTodos.map((todo) => {
+              const cycleChecked = isRecurringCycleChecked(todo);
+              const recurringOpen = isRecurringTag(todo.recurrenceTag) && !todo.completed;
+
+              return (
+                <li key={todo.id}>
+                  <div
+                    role="button"
+                    tabIndex={0}
+                    className={`todo-item ${selectedTodoId === todo.id ? 'selected' : ''}`}
+                    onClick={() => handleTodoSelect(todo.id)}
+                    onKeyDown={(event) => {
+                      if (event.key === 'Enter' || event.key === ' ') {
+                        event.preventDefault();
+                        handleTodoSelect(todo.id);
+                      }
+                    }}
+                  >
+                    <input
+                      type="checkbox"
+                      checked={cycleChecked}
+                      onChange={() => void handleChecklistToggle(todo)}
+                      onClick={(event) => event.stopPropagation()}
+                      aria-label={
+                        !isRecurringTag(todo.recurrenceTag) || todo.completed
+                          ? `Mark ${formatDisplayTitle(todo)} as ${todo.completed ? 'open' : 'done'}`
+                          : cycleChecked
+                            ? `Clear this cycle check for ${formatDisplayTitle(todo)}`
+                            : `Mark ${formatDisplayTitle(todo)} done for this cycle`
+                      }
+                    />
+                    <div>
+                      <p className={todo.completed ? 'done' : recurringOpen && cycleChecked ? 'cycle-complete' : ''}>
+                        {formatDisplayTitle(todo)}
+                      </p>
+                      <span>{formatDateLabel(todo.dueDate)}</span>
+                      {recurringOpen && cycleChecked && (
+                        <span className="recurrence-state">{getCycleStatusLabel(todo.recurrenceTag)}</span>
+                      )}
+                    </div>
                   </div>
-                </div>
-              </li>
-            ))}
+                </li>
+              );
+            })}
           </ul>
 
           {filteredTodos.length === 0 && <p className="empty-state">No tasks match this view.</p>}
@@ -727,6 +867,7 @@ function App() {
                   >
                     <option value="none">No tag</option>
                     <option value="daily">Daily</option>
+                    <option value="weekly">Weekly</option>
                     <option value="bi-weekly">Bi-weekly</option>
                   </select>
                 </div>
@@ -747,10 +888,36 @@ function App() {
 
                 <div className="field-row">
                   <label htmlFor="status">Status</label>
-                  <button id="status" type="button" className="status-toggle" onClick={() => void toggleTodo(selectedTodo.id)}>
-                    {selectedTodo.completed ? 'Done' : 'Open'}
-                  </button>
+                  <div className="status-cell">
+                    <button id="status" type="button" className="status-toggle" onClick={() => void toggleTodo(selectedTodo.id)}>
+                      {getStatusButtonLabel(selectedTodo)}
+                    </button>
+                    {isRecurringTag(selectedTodo.recurrenceTag) && !selectedTodo.completed && (
+                      <p className="status-hint">Recurring tasks stay in Open when checked in the task list.</p>
+                    )}
+                  </div>
                 </div>
+
+                {isRecurringTag(selectedTodo.recurrenceTag) && !selectedTodo.completed && (
+                  <div className="field-row">
+                    <label htmlFor="cycle-check">This cycle</label>
+                    <button
+                      id="cycle-check"
+                      type="button"
+                      className="status-toggle"
+                      onClick={() =>
+                        void setRecurringCycleCheck(
+                          selectedTodo.id,
+                          !isRecurringCycleChecked(selectedTodo),
+                        )
+                      }
+                    >
+                      {isRecurringCycleChecked(selectedTodo)
+                        ? 'Clear cycle check'
+                        : `Mark ${getRecurrenceLabel(selectedTodo.recurrenceTag)} done`}
+                    </button>
+                  </div>
+                )}
 
                 <section className="appearance-panel" aria-label="Appearance settings">
                   <p className="appearance-title">Appearance</p>
