@@ -7,6 +7,7 @@ import type {
   Todo,
   UiPrefs,
   UpdateTodoInput,
+  WindowSizeClass,
   WindowPrefs,
 } from './types';
 
@@ -141,6 +142,10 @@ export async function saveWindowPrefs(input: WindowPrefs): Promise<void> {
 
 export async function setPanelMode(mode: PanelMode): Promise<WindowPrefs> {
   return invokeCommand<WindowPrefs>('set_panel_mode', { mode });
+}
+
+export async function setWindowSizeClass(sizeClass: WindowSizeClass): Promise<WindowPrefs> {
+  return invokeCommand<WindowPrefs>('set_window_size_class', { sizeClass });
 }
 
 export async function setAlwaysOnTop(enabled: boolean): Promise<WindowPrefs> {

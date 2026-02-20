@@ -1,6 +1,7 @@
 export type Filter = 'all' | 'open' | 'done';
 
 export type PanelMode = 'mini' | 'expanded';
+export type WindowSizeClass = 'mini' | 'standard' | 'wide';
 export type MotionMode = 'balanced' | 'high' | 'low';
 export type ReadabilityMode = 'adaptive' | 'pure' | 'strong';
 export type ReduceMotionOverride = 'system' | 'on' | 'off';
@@ -51,6 +52,7 @@ export type WindowPrefs = {
   width: number;
   height: number;
   mode: PanelMode;
+  sizeClass: WindowSizeClass;
   alwaysOnTop: boolean;
 };
 

@@ -15,6 +15,12 @@ const RECURRENCE_NONE: &str = "none";
 const RECURRENCE_DAILY: &str = "daily";
 const RECURRENCE_WEEKLY: &str = "weekly";
 const RECURRENCE_BI_WEEKLY: &str = "bi-weekly";
+const MINI_WIDTH: f64 = 380.0;
+const MINI_HEIGHT: f64 = 520.0;
+const STANDARD_WIDTH: f64 = 760.0;
+const STANDARD_HEIGHT: f64 = 620.0;
+const WIDE_WIDTH: f64 = 920.0;
+const WIDE_HEIGHT: f64 = 680.0;
 
 type CommandResult<T> = Result<T, String>;
 
@@ -86,6 +92,14 @@ enum PanelMode {
   Expanded,
 }
 
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+enum WindowSizeClass {
+  Mini,
+  Standard,
+  Wide,
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 enum MotionMode {
@@ -118,6 +132,18 @@ struct WindowPrefs {
   width: f64,
   height: f64,
   mode: PanelMode,
+  size_class: WindowSizeClass,
+  always_on_top: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LegacyWindowPrefs {
+  x: f64,
+  y: f64,
+  width: f64,
+  height: f64,
+  mode: PanelMode,
   always_on_top: bool,
 }
 
@@ -134,9 +160,10 @@ impl Default for WindowPrefs {
     Self {
       x: 80.0,
       y: 80.0,
-      width: 380.0,
-      height: 520.0,
+      width: MINI_WIDTH,
+      height: MINI_HEIGHT,
       mode: PanelMode::Mini,
+      size_class: WindowSizeClass::Mini,
       always_on_top: true,
     }
   }
@@ -174,6 +201,52 @@ fn normalize_recurrence_tag(value: Option<String>) -> String {
     Some(RECURRENCE_BI_WEEKLY) => RECURRENCE_BI_WEEKLY.to_string(),
     _ => RECURRENCE_NONE.to_string(),
   }
+}
+
+fn mode_from_size_class(size_class: &WindowSizeClass) -> PanelMode {
+  match size_class {
+    WindowSizeClass::Mini => PanelMode::Mini,
+    WindowSizeClass::Standard | WindowSizeClass::Wide => PanelMode::Expanded,
+  }
+}
+
+fn dimensions_for_size_class(size_class: &WindowSizeClass) -> (f64, f64) {
+  match size_class {
+    WindowSizeClass::Mini => (MINI_WIDTH, MINI_HEIGHT),
+    WindowSizeClass::Standard => (STANDARD_WIDTH, STANDARD_HEIGHT),
+    WindowSizeClass::Wide => (WIDE_WIDTH, WIDE_HEIGHT),
+  }
+}
+
+fn infer_size_class_from_dimensions(width: f64, height: f64) -> WindowSizeClass {
+  let candidates = [
+    (WindowSizeClass::Mini, MINI_WIDTH, MINI_HEIGHT),
+    (WindowSizeClass::Standard, STANDARD_WIDTH, STANDARD_HEIGHT),
+    (WindowSizeClass::Wide, WIDE_WIDTH, WIDE_HEIGHT),
+  ];
+
+  let mut best = WindowSizeClass::Mini;
+  let mut best_score = f64::MAX;
+
+  for (candidate, target_width, target_height) in candidates {
+    let width_score = (width - target_width).abs();
+    let height_score = (height - target_height).abs();
+    let score = (width_score * 0.65) + (height_score * 0.35);
+    if score < best_score {
+      best_score = score;
+      best = candidate;
+    }
+  }
+
+  best
+}
+
+fn normalize_window_prefs(mut prefs: WindowPrefs) -> WindowPrefs {
+  let (width, height) = dimensions_for_size_class(&prefs.size_class);
+  prefs.width = width;
+  prefs.height = height;
+  prefs.mode = mode_from_size_class(&prefs.size_class);
+  prefs
 }
 
 fn to_db_bool(value: bool) -> i64 {
@@ -284,7 +357,22 @@ fn get_window_prefs_from_conn(conn: &Connection) -> CommandResult<WindowPrefs> {
   let raw = get_meta(conn, WINDOW_PREFS_KEY)?;
 
   match raw {
-    Some(value) => serde_json::from_str::<WindowPrefs>(&value).map_err(|err| err.to_string()),
+    Some(value) => match serde_json::from_str::<WindowPrefs>(&value) {
+      Ok(parsed) => Ok(normalize_window_prefs(parsed)),
+      Err(_) => {
+        let legacy = serde_json::from_str::<LegacyWindowPrefs>(&value).map_err(|err| err.to_string())?;
+        let size_class = infer_size_class_from_dimensions(legacy.width, legacy.height);
+        Ok(normalize_window_prefs(WindowPrefs {
+          x: legacy.x,
+          y: legacy.y,
+          width: legacy.width,
+          height: legacy.height,
+          mode: legacy.mode,
+          size_class,
+          always_on_top: legacy.always_on_top,
+        }))
+      }
+    },
     None => Ok(WindowPrefs::default()),
   }
 }
@@ -349,8 +437,11 @@ fn save_window_size(app: &AppHandle, width: f64, height: f64) -> CommandResult<(
     .lock()
     .map_err(|_| "Failed to acquire database lock".to_string())?;
   let mut prefs = get_window_prefs_from_conn(&conn)?;
+  let inferred = infer_size_class_from_dimensions(width, height);
   prefs.width = width;
   prefs.height = height;
+  prefs.size_class = inferred;
+  prefs.mode = mode_from_size_class(&prefs.size_class);
   save_window_prefs_to_conn(&conn, &prefs)
 }
 
@@ -726,7 +817,8 @@ fn save_window_prefs(state: State<'_, AppState>, input: WindowPrefs) -> CommandR
     .lock()
     .map_err(|_| "Failed to acquire database lock".to_string())?;
 
-  save_window_prefs_to_conn(&conn, &input)
+  let normalized = normalize_window_prefs(input);
+  save_window_prefs_to_conn(&conn, &normalized)
 }
 
 #[tauri::command]
@@ -755,10 +847,21 @@ fn set_panel_mode(
   app: AppHandle,
   mode: PanelMode,
 ) -> CommandResult<WindowPrefs> {
-  let (target_width, target_height) = match mode {
-    PanelMode::Mini => (380.0, 520.0),
-    PanelMode::Expanded => (920.0, 680.0),
+  // Compatibility alias. New sizing uses explicit window size classes.
+  let target_size_class = match mode {
+    PanelMode::Mini => WindowSizeClass::Mini,
+    PanelMode::Expanded => WindowSizeClass::Wide,
   };
+
+  set_window_size_class_inner(state, app, target_size_class)
+}
+
+fn set_window_size_class_inner(
+  state: State<'_, AppState>,
+  app: AppHandle,
+  size_class: WindowSizeClass,
+) -> CommandResult<WindowPrefs> {
+  let (target_width, target_height) = dimensions_for_size_class(&size_class);
 
   if let Some(window) = app.get_webview_window("main") {
     window
@@ -772,12 +875,22 @@ fn set_panel_mode(
     .map_err(|_| "Failed to acquire database lock".to_string())?;
 
   let mut prefs = get_window_prefs_from_conn(&conn)?;
-  prefs.mode = mode;
+  prefs.size_class = size_class;
+  prefs.mode = mode_from_size_class(&prefs.size_class);
   prefs.width = target_width;
   prefs.height = target_height;
   save_window_prefs_to_conn(&conn, &prefs)?;
 
   Ok(prefs)
+}
+
+#[tauri::command]
+fn set_window_size_class(
+  state: State<'_, AppState>,
+  app: AppHandle,
+  size_class: WindowSizeClass,
+) -> CommandResult<WindowPrefs> {
+  set_window_size_class_inner(state, app, size_class)
 }
 
 #[tauri::command]
@@ -840,6 +953,7 @@ fn main() {
       get_ui_prefs,
       save_ui_prefs,
       set_panel_mode,
+      set_window_size_class,
       set_always_on_top,
     ])
     .run(tauri::generate_context!())

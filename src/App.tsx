@@ -11,7 +11,7 @@ import {
   saveUiPrefs,
   setRecurrenceCheck as setRecurrenceCheckRecord,
   setAlwaysOnTop as setAlwaysOnTopRecord,
-  setPanelMode as setPanelModeRecord,
+  setWindowSizeClass as setWindowSizeClassRecord,
   toggleTodo as toggleTodoRecord,
   updateTodo as updateTodoRecord,
 } from './storage';
@@ -19,12 +19,12 @@ import type {
   DeletedSnapshot,
   Filter,
   MotionMode,
-  PanelMode,
   ReadabilityMode,
   RecurrenceTag,
   ReduceMotionOverride,
   Todo,
   UiPrefs,
+  WindowSizeClass,
 } from './types';
 
 type TodoPatch = {
@@ -41,6 +41,47 @@ const DEFAULT_UI_PREFS: UiPrefs = {
   readabilityMode: 'adaptive',
   reduceMotionOverride: 'system',
 };
+
+const SIZE_CLASS_DIMENSIONS: Record<WindowSizeClass, { width: number; height: number }> = {
+  mini: { width: 380, height: 520 },
+  standard: { width: 760, height: 620 },
+  wide: { width: 920, height: 680 },
+};
+
+const RESIZE_SNAP_DEBOUNCE_MS = 180;
+const RESIZE_STABILITY_HOLD_MS = 160;
+
+function getSizeClassLabel(sizeClass: WindowSizeClass): string {
+  if (sizeClass === 'mini') {
+    return 'Compact';
+  }
+  if (sizeClass === 'standard') {
+    return 'Standard';
+  }
+  return 'Wide';
+}
+
+function resolveNearestSizeClass(width: number, height: number): WindowSizeClass {
+  const entries = Object.entries(SIZE_CLASS_DIMENSIONS) as Array<
+    [WindowSizeClass, { width: number; height: number }]
+  >;
+
+  let best: WindowSizeClass = 'mini';
+  let bestScore = Number.POSITIVE_INFINITY;
+
+  for (const [candidate, dimensions] of entries) {
+    const widthScore = Math.abs(width - dimensions.width);
+    const heightScore = Math.abs(height - dimensions.height);
+    const score = widthScore * 0.65 + heightScore * 0.35;
+
+    if (score < bestScore) {
+      bestScore = score;
+      best = candidate;
+    }
+  }
+
+  return best;
+}
 
 function getRecurrencePrefix(tag: RecurrenceTag): string {
   if (tag === 'daily') {
@@ -192,14 +233,19 @@ function toErrorMessage(error: unknown): string {
 function App() {
   const shellRef = useRef<HTMLDivElement | null>(null);
   const pointerFrame = useRef<number | null>(null);
+  const resizeSnapTimer = useRef<number | null>(null);
+  const resizeReleaseTimer = useRef<number | null>(null);
+  const activeSizeClassRef = useRef<WindowSizeClass>('mini');
+  const finishFxTimers = useRef<Map<string, number>>(new Map());
 
   const [todos, setTodos] = useState<Todo[]>([]);
   const [selectedTodoId, setSelectedTodoId] = useState<string | null>(null);
   const [filter, setFilter] = useState<Filter>('all');
   const [search, setSearch] = useState('');
 
-  const [panelMode, setPanelMode] = useState<PanelMode>('mini');
+  const [sizeClass, setSizeClass] = useState<WindowSizeClass>('mini');
   const [alwaysOnTop, setAlwaysOnTop] = useState(true);
+  const [isResizingWindow, setIsResizingWindow] = useState(false);
 
   const [newTitle, setNewTitle] = useState('');
   const [newRecurrenceTag, setNewRecurrenceTag] = useState<RecurrenceTag>('none');
@@ -215,12 +261,14 @@ function App() {
   const [deletedSnapshot, setDeletedSnapshot] = useState<DeletedSnapshot | null>(null);
   const [loading, setLoading] = useState(true);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
+  const [finishingTodoIds, setFinishingTodoIds] = useState<string[]>([]);
 
   const undoTimer = useRef<number | null>(null);
 
   const selectedTodo = todos.find((todo) => todo.id === selectedTodoId) ?? null;
   const openCount = todos.filter((todo) => !todo.completed).length;
   const effectiveReducedMotion =
+    isResizingWindow ||
     uiPrefs.reduceMotionOverride === 'on' ||
     (uiPrefs.reduceMotionOverride === 'system' && systemPrefersReducedMotion);
 
@@ -248,6 +296,10 @@ function App() {
       );
     });
   }, [filter, search, todos]);
+
+  useEffect(() => {
+    activeSizeClassRef.current = sizeClass;
+  }, [sizeClass]);
 
   useEffect(() => {
     const media = window.matchMedia('(prefers-reduced-motion: reduce)');
@@ -334,6 +386,47 @@ function App() {
   }, [effectiveReducedMotion, uiPrefs.motionMode]);
 
   useEffect(() => {
+    const onResize = () => {
+      setIsResizingWindow(true);
+
+      if (resizeSnapTimer.current !== null) {
+        window.clearTimeout(resizeSnapTimer.current);
+      }
+
+      if (resizeReleaseTimer.current !== null) {
+        window.clearTimeout(resizeReleaseTimer.current);
+      }
+
+      resizeSnapTimer.current = window.setTimeout(() => {
+        resizeSnapTimer.current = null;
+        const target = resolveNearestSizeClass(window.innerWidth, window.innerHeight);
+        if (target !== activeSizeClassRef.current) {
+          void switchSizeClass(target);
+        }
+
+        resizeReleaseTimer.current = window.setTimeout(() => {
+          resizeReleaseTimer.current = null;
+          setIsResizingWindow(false);
+        }, RESIZE_STABILITY_HOLD_MS);
+      }, RESIZE_SNAP_DEBOUNCE_MS);
+    };
+
+    window.addEventListener('resize', onResize);
+
+    return () => {
+      window.removeEventListener('resize', onResize);
+      if (resizeSnapTimer.current !== null) {
+        window.clearTimeout(resizeSnapTimer.current);
+        resizeSnapTimer.current = null;
+      }
+      if (resizeReleaseTimer.current !== null) {
+        window.clearTimeout(resizeReleaseTimer.current);
+        resizeReleaseTimer.current = null;
+      }
+    };
+  }, []);
+
+  useEffect(() => {
     let active = true;
 
     async function loadApp() {
@@ -357,7 +450,9 @@ function App() {
 
         setTodos(initialTodos);
         setSelectedTodoId(initialTodos[0]?.id ?? null);
-        setPanelMode(prefs.mode);
+        const restoredSizeClass = prefs.sizeClass ?? (prefs.mode === 'mini' ? 'mini' : 'wide');
+        activeSizeClassRef.current = restoredSizeClass;
+        setSizeClass(restoredSizeClass);
         setAlwaysOnTop(prefs.alwaysOnTop);
         setUiPrefs(nextUiPrefs);
       } catch (error) {
@@ -378,6 +473,10 @@ function App() {
       if (undoTimer.current !== null) {
         window.clearTimeout(undoTimer.current);
       }
+      for (const timer of finishFxTimers.current.values()) {
+        window.clearTimeout(timer);
+      }
+      finishFxTimers.current.clear();
     };
   }, []);
 
@@ -512,6 +611,10 @@ function App() {
       return;
     }
 
+    if (!target.completed) {
+      triggerFinishEffect(todoId);
+    }
+
     setTodos((previous) =>
       previous.map((todo) =>
         todo.id === todoId ? { ...todo, completed: !todo.completed, updatedAt: new Date().toISOString() } : todo,
@@ -532,6 +635,10 @@ function App() {
     const target = todos.find((todo) => todo.id === todoId);
     if (!target || !isRecurringTag(target.recurrenceTag)) {
       return;
+    }
+
+    if (checked && !isRecurringCycleChecked(target)) {
+      triggerFinishEffect(todoId);
     }
 
     const optimistic: Todo = {
@@ -560,6 +667,22 @@ function App() {
 
     const checked = isRecurringCycleChecked(todo);
     await setRecurringCycleCheck(todo.id, !checked);
+  }
+
+  function triggerFinishEffect(todoId: string) {
+    setFinishingTodoIds((current) => (current.includes(todoId) ? current : [...current, todoId]));
+
+    const activeTimer = finishFxTimers.current.get(todoId);
+    if (activeTimer !== undefined) {
+      window.clearTimeout(activeTimer);
+    }
+
+    const timer = window.setTimeout(() => {
+      setFinishingTodoIds((current) => current.filter((id) => id !== todoId));
+      finishFxTimers.current.delete(todoId);
+    }, 700);
+
+    finishFxTimers.current.set(todoId, timer);
   }
 
   async function finalizeDelete(todoId: string) {
@@ -643,21 +766,25 @@ function App() {
     }
   }
 
-  async function switchPanelMode(nextMode: PanelMode) {
-    if (nextMode === panelMode) {
+  async function switchSizeClass(nextSizeClass: WindowSizeClass) {
+    const currentSizeClass = activeSizeClassRef.current;
+    if (nextSizeClass === currentSizeClass) {
       return;
     }
 
-    const previousMode = panelMode;
-    setPanelMode(nextMode);
+    setSizeClass(nextSizeClass);
+    activeSizeClassRef.current = nextSizeClass;
 
     try {
-      const prefs = await setPanelModeRecord(nextMode);
-      setPanelMode(prefs.mode);
+      const prefs = await setWindowSizeClassRecord(nextSizeClass);
+      const resolvedSizeClass = prefs.sizeClass ?? (prefs.mode === 'mini' ? 'mini' : 'wide');
+      activeSizeClassRef.current = resolvedSizeClass;
+      setSizeClass(resolvedSizeClass);
       setAlwaysOnTop(prefs.alwaysOnTop);
       setErrorMessage(null);
     } catch (error) {
-      setPanelMode(previousMode);
+      activeSizeClassRef.current = currentSizeClass;
+      setSizeClass(currentSizeClass);
       setErrorMessage(toErrorMessage(error));
     }
   }
@@ -679,30 +806,42 @@ function App() {
   function handleTodoSelect(todoId: string) {
     setSelectedTodoId(todoId);
 
-    if (panelMode === 'mini') {
-      void switchPanelMode('expanded');
+    if (sizeClass === 'mini') {
+      void switchSizeClass('standard');
     }
+  }
+
+  function openTodoDetails(todoId: string) {
+    handleTodoSelect(todoId);
   }
 
   return (
     <div
       ref={shellRef}
-      className={`app-shell ${panelMode}`}
+      className="app-shell"
+      data-size-class={sizeClass}
       data-motion={uiPrefs.motionMode}
       data-readability={uiPrefs.readabilityMode}
       data-reduce-motion={effectiveReducedMotion ? 'true' : 'false'}
+      data-resizing-window={isResizingWindow ? 'true' : 'false'}
     >
       <header className="top-bar">
-        <div>
-          <p className="eyebrow">Simple Todo Note</p>
-          <h1>Focus list</h1>
+        <div className="title-block">
+          <h1>Today's Tasks</h1>
         </div>
 
         <div className="window-controls">
-          <p className="open-count">{openCount} open</p>
-          <button type="button" onClick={() => void switchPanelMode(panelMode === 'mini' ? 'expanded' : 'mini')}>
-            {panelMode === 'mini' ? 'Expand' : 'Compact'}
-          </button>
+          <p className="metric-pill">{openCount} active</p>
+          {(['mini', 'standard', 'wide'] as const).map((option) => (
+            <button
+              key={option}
+              type="button"
+              className={sizeClass === option ? 'active-size' : ''}
+              onClick={() => void switchSizeClass(option)}
+            >
+              {getSizeClassLabel(option)}
+            </button>
+          ))}
           <button
             type="button"
             className={alwaysOnTop ? 'pin-active' : ''}
@@ -792,34 +931,30 @@ function App() {
             {filteredTodos.map((todo) => {
               const cycleChecked = isRecurringCycleChecked(todo);
               const recurringOpen = isRecurringTag(todo.recurrenceTag) && !todo.completed;
+              const isFinishing = finishingTodoIds.includes(todo.id);
 
               return (
                 <li key={todo.id}>
                   <div
                     role="button"
                     tabIndex={0}
-                    className={`todo-item ${selectedTodoId === todo.id ? 'selected' : ''}`}
-                    onClick={() => handleTodoSelect(todo.id)}
+                    className={`todo-item ${selectedTodoId === todo.id ? 'selected' : ''} ${isFinishing ? 'finish-fx' : ''}`}
+                    onClick={() => void handleChecklistToggle(todo)}
                     onKeyDown={(event) => {
                       if (event.key === 'Enter' || event.key === ' ') {
                         event.preventDefault();
-                        handleTodoSelect(todo.id);
+                        void handleChecklistToggle(todo);
                       }
                     }}
+                    aria-label={
+                      !isRecurringTag(todo.recurrenceTag) || todo.completed
+                        ? `${todo.completed ? 'Reopen' : 'Complete'} ${formatDisplayTitle(todo)}`
+                        : cycleChecked
+                          ? `Clear this cycle check for ${formatDisplayTitle(todo)}`
+                          : `Mark ${formatDisplayTitle(todo)} done for this cycle`
+                    }
                   >
-                    <input
-                      type="checkbox"
-                      checked={cycleChecked}
-                      onChange={() => void handleChecklistToggle(todo)}
-                      onClick={(event) => event.stopPropagation()}
-                      aria-label={
-                        !isRecurringTag(todo.recurrenceTag) || todo.completed
-                          ? `Mark ${formatDisplayTitle(todo)} as ${todo.completed ? 'open' : 'done'}`
-                          : cycleChecked
-                            ? `Clear this cycle check for ${formatDisplayTitle(todo)}`
-                            : `Mark ${formatDisplayTitle(todo)} done for this cycle`
-                      }
-                    />
+                    <span className={`status-pill ${cycleChecked ? 'checked' : ''}`} aria-hidden="true" />
                     <div>
                       <p className={todo.completed ? 'done' : recurringOpen && cycleChecked ? 'cycle-complete' : ''}>
                         {formatDisplayTitle(todo)}
@@ -829,6 +964,16 @@ function App() {
                         <span className="recurrence-state">{getCycleStatusLabel(todo.recurrenceTag)}</span>
                       )}
                     </div>
+                    <button
+                      type="button"
+                      className="todo-details"
+                      onClick={(event) => {
+                        event.stopPropagation();
+                        openTodoDetails(todo.id);
+                      }}
+                    >
+                      Details
+                    </button>
                   </div>
                 </li>
               );
@@ -838,7 +983,7 @@ function App() {
           {filteredTodos.length === 0 && <p className="empty-state">No tasks match this view.</p>}
         </aside>
 
-        {panelMode === 'expanded' && (
+        {sizeClass !== 'mini' && (
           <article className="detail-panel">
             {selectedTodo ? (
               <>
@@ -849,7 +994,7 @@ function App() {
                     aria-label="Edit task title"
                     maxLength={160}
                   />
-                  <button type="button" onClick={() => deleteTodo(selectedTodo.id)}>
+                  <button type="button" className="danger-button" onClick={() => deleteTodo(selectedTodo.id)}>
                     Delete
                   </button>
                 </div>

@@ -11,7 +11,7 @@ Always-visible Windows desktop todo app with an Apple-inspired liquid glass UI.
 - Explicit status control to move any task to `done` / `open`
 - Search and filters (`all`, `open`, `done`)
 - One-time legacy migration from old `localStorage` data
-- Always-on-top panel mode (`mini` / `expanded`)
+- Window size classes with snap-to-stable geometry (`mini`, `standard`, `wide`)
 - Appearance controls persisted to SQLite (`motion`, `readability`, `reduce motion`)
 - Auto-start registration at Windows login
 - Soft-delete with 5-second undo
@@ -60,7 +60,7 @@ Current identifier in `src-tauri/tauri.conf.json`:
 
 ## Project structure
 
-- `src/App.tsx`: UI, async CRUD flows, panel controls
+- `src/App.tsx`: UI, async CRUD flows, size-class controls
 - `src/storage.ts`: Tauri invoke adapters + migration helpers
 - `src/types.ts`: shared frontend data contracts
 - `src/styles.css`: liquid glass styling, responsive layout, motion/readability modes
