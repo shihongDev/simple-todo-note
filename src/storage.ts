@@ -1,5 +1,7 @@
 import type {
   CreateTodoInput,
+  DailyHeatmapDay,
+  DueReminder,
   LegacyTodo,
   MigrationResult,
   PanelMode,
@@ -158,4 +160,12 @@ export async function getUiPrefs(): Promise<UiPrefs> {
 
 export async function saveUiPrefs(input: UiPrefs): Promise<void> {
   await invokeCommand('save_ui_prefs', { input });
+}
+
+export async function getDailyCompletionHeatmap(days: number): Promise<DailyHeatmapDay[]> {
+  return invokeCommand<DailyHeatmapDay[]>('get_daily_completion_heatmap', { days });
+}
+
+export async function consumeDailyDueReminders(): Promise<DueReminder[]> {
+  return invokeCommand<DueReminder[]>('consume_daily_due_reminders');
 }

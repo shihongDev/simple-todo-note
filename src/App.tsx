@@ -1,8 +1,10 @@
 import { FormEvent, useEffect, useMemo, useRef, useState } from 'react';
 import {
   clearLegacyLocalStorage,
+  consumeDailyDueReminders,
   createTodo as createTodoRecord,
   deleteTodo as deleteTodoRecord,
+  getDailyCompletionHeatmap,
   getUiPrefs,
   getWindowPrefs,
   listTodos,
@@ -16,6 +18,8 @@ import {
   updateTodo as updateTodoRecord,
 } from './storage';
 import type {
+  DailyHeatmapDay,
+  DueReminder,
   DeletedSnapshot,
   Filter,
   MotionMode,
@@ -34,6 +38,7 @@ type TodoPatch = {
   note?: string;
   completed?: boolean;
   dueDate?: string | null;
+  reminderEnabled?: boolean;
 };
 
 const DEFAULT_UI_PREFS: UiPrefs = {
@@ -50,6 +55,18 @@ const SIZE_CLASS_DIMENSIONS: Record<WindowSizeClass, { width: number; height: nu
 
 const RESIZE_SNAP_DEBOUNCE_MS = 180;
 const RESIZE_STABILITY_HOLD_MS = 160;
+const DAILY_HEATMAP_DAYS = 90;
+const HEATMAP_ROW_ORDER = [0, 1, 2, 3, 4, 5, 6] as const;
+
+type DailyHeatmapCell = {
+  date: string;
+  count: number;
+  level: 0 | 1 | 2 | 3 | 4;
+  label: string;
+  isToday: boolean;
+};
+
+type UrgencyLevel = 'none' | 'upcoming' | 'soon' | 'today' | 'overdue';
 
 function getSizeClassLabel(sizeClass: WindowSizeClass): string {
   if (sizeClass === 'mini') {
@@ -218,6 +235,155 @@ function formatDateLabel(value: string | null): string {
   }
 }
 
+function toLocalDateKey(date: Date): string {
+  const year = date.getFullYear();
+  const month = String(date.getMonth() + 1).padStart(2, '0');
+  const day = String(date.getDate()).padStart(2, '0');
+  return `${year}-${month}-${day}`;
+}
+
+function toDateLabelFromKey(dateKey: string): string {
+  const [yearRaw, monthRaw, dayRaw] = dateKey.split('-');
+  const year = Number(yearRaw);
+  const month = Number(monthRaw);
+  const day = Number(dayRaw);
+
+  if (
+    Number.isNaN(year) ||
+    Number.isNaN(month) ||
+    Number.isNaN(day) ||
+    year < 1 ||
+    month < 1 ||
+    month > 12 ||
+    day < 1 ||
+    day > 31
+  ) {
+    return dateKey;
+  }
+
+  return new Date(year, month - 1, day).toLocaleDateString(undefined, {
+    month: 'short',
+    day: 'numeric',
+    year: 'numeric',
+  });
+}
+
+function parseLocalDateKey(dateKey: string): Date | null {
+  const [yearRaw, monthRaw, dayRaw] = dateKey.split('-');
+  const year = Number(yearRaw);
+  const month = Number(monthRaw);
+  const day = Number(dayRaw);
+
+  if (
+    Number.isNaN(year) ||
+    Number.isNaN(month) ||
+    Number.isNaN(day) ||
+    year < 1 ||
+    month < 1 ||
+    month > 12 ||
+    day < 1 ||
+    day > 31
+  ) {
+    return null;
+  }
+
+  const parsed = new Date(year, month - 1, day);
+  parsed.setHours(0, 0, 0, 0);
+  return parsed;
+}
+
+function getTodoUrgency(todo: Todo, now: Date = new Date()): UrgencyLevel {
+  if (todo.completed) {
+    return 'none';
+  }
+
+  if (isRecurringTag(todo.recurrenceTag) && isRecurringCycleChecked(todo, now)) {
+    return 'none';
+  }
+
+  if (!todo.dueDate) {
+    return 'none';
+  }
+
+  const dueDate = parseLocalDateKey(todo.dueDate);
+  if (!dueDate) {
+    return 'none';
+  }
+
+  const today = new Date(now);
+  today.setHours(0, 0, 0, 0);
+
+  const deltaDays = Math.round((dueDate.getTime() - today.getTime()) / (24 * 60 * 60 * 1000));
+
+  if (deltaDays < 0) {
+    return 'overdue';
+  }
+  if (deltaDays === 0) {
+    return 'today';
+  }
+  if (deltaDays <= 2) {
+    return 'soon';
+  }
+  if (deltaDays <= 7) {
+    return 'upcoming';
+  }
+  return 'none';
+}
+
+function buildReminderNotification(reminders: DueReminder[]): { title: string; body: string } {
+  if (reminders.length === 0) {
+    return { title: '', body: '' };
+  }
+
+  if (reminders.length === 1) {
+    const reminder = reminders[0];
+    const prefix =
+      reminder.daysOverdue > 0
+        ? `Overdue by ${reminder.daysOverdue} day${reminder.daysOverdue === 1 ? '' : 's'}`
+        : 'Due today';
+    return {
+      title: `${prefix}: ${reminder.title}`,
+      body: `Due ${toDateLabelFromKey(reminder.dueDate)}`,
+    };
+  }
+
+  const overdueCount = reminders.filter((reminder) => reminder.daysOverdue > 0).length;
+  const todayCount = reminders.length - overdueCount;
+
+  const parts: string[] = [];
+  if (todayCount > 0) {
+    parts.push(`${todayCount} due today`);
+  }
+  if (overdueCount > 0) {
+    parts.push(`${overdueCount} overdue`);
+  }
+
+  return {
+    title: `${reminders.length} tasks need attention`,
+    body: `${parts.join(' • ')}${parts.length > 0 ? ' • ' : ''}${reminders[0].title}`,
+  };
+}
+
+function toHeatmapLevel(count: number): 0 | 1 | 2 | 3 | 4 {
+  if (count <= 0) {
+    return 0;
+  }
+
+  if (count === 1) {
+    return 1;
+  }
+
+  if (count <= 3) {
+    return 2;
+  }
+
+  if (count <= 5) {
+    return 3;
+  }
+
+  return 4;
+}
+
 function toErrorMessage(error: unknown): string {
   if (error instanceof Error) {
     return error.message;
@@ -237,6 +403,8 @@ function App() {
   const resizeReleaseTimer = useRef<number | null>(null);
   const activeSizeClassRef = useRef<WindowSizeClass>('mini');
   const finishFxTimers = useRef<Map<string, number>>(new Map());
+  const midnightReminderTimer = useRef<number | null>(null);
+  const reminderCheckInFlight = useRef(false);
 
   const [todos, setTodos] = useState<Todo[]>([]);
   const [selectedTodoId, setSelectedTodoId] = useState<string | null>(null);
@@ -262,6 +430,7 @@ function App() {
   const [loading, setLoading] = useState(true);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [finishingTodoIds, setFinishingTodoIds] = useState<string[]>([]);
+  const [dailyHeatmapDays, setDailyHeatmapDays] = useState<DailyHeatmapDay[]>([]);
 
   const undoTimer = useRef<number | null>(null);
 
@@ -296,6 +465,58 @@ function App() {
       );
     });
   }, [filter, search, todos]);
+
+  const dailyHeatmap = useMemo(() => {
+    const countByDate = new Map<string, number>();
+    for (const entry of dailyHeatmapDays) {
+      const nextCount = Number.isFinite(entry.count) ? Math.max(0, Math.floor(entry.count)) : 0;
+      countByDate.set(entry.date, nextCount);
+    }
+
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+    const todayKey = toLocalDateKey(today);
+
+    const cells: DailyHeatmapCell[] = [];
+    for (let offset = DAILY_HEATMAP_DAYS - 1; offset >= 0; offset -= 1) {
+      const date = new Date(today);
+      date.setDate(today.getDate() - offset);
+      const dateKey = toLocalDateKey(date);
+      const count = countByDate.get(dateKey) ?? 0;
+
+      cells.push({
+        date: dateKey,
+        count,
+        level: 0,
+        label: `${count} daily ${count === 1 ? 'task' : 'tasks'} done on ${toDateLabelFromKey(dateKey)}`,
+        isToday: dateKey === todayKey,
+      });
+    }
+
+    const maxCount = cells.reduce((max, cell) => Math.max(max, cell.count), 0);
+    const leveledCells = cells.map((cell) => ({
+      ...cell,
+      level: toHeatmapLevel(cell.count),
+    }));
+
+    const startDate = new Date(today);
+    startDate.setDate(today.getDate() - (DAILY_HEATMAP_DAYS - 1));
+    const leadingEmptyCells = startDate.getDay();
+    const flatGrid: Array<DailyHeatmapCell | null> = [
+      ...Array.from({ length: leadingEmptyCells }, () => null),
+      ...leveledCells,
+    ];
+
+    const weeks: Array<Array<DailyHeatmapCell | null>> = [];
+    for (let index = 0; index < flatGrid.length; index += 7) {
+      weeks.push(flatGrid.slice(index, index + 7));
+    }
+
+    return {
+      weeks,
+      maxCount,
+    };
+  }, [dailyHeatmapDays]);
 
   useEffect(() => {
     activeSizeClassRef.current = sizeClass;
@@ -438,10 +659,11 @@ function App() {
           clearLegacyLocalStorage();
         }
 
-        const [initialTodos, prefs, nextUiPrefs] = await Promise.all([
+        const [initialTodos, prefs, nextUiPrefs, nextHeatmap] = await Promise.all([
           listTodos(),
           getWindowPrefs(),
           getUiPrefs(),
+          getDailyCompletionHeatmap(DAILY_HEATMAP_DAYS),
         ]);
 
         if (!active) {
@@ -455,6 +677,7 @@ function App() {
         setSizeClass(restoredSizeClass);
         setAlwaysOnTop(prefs.alwaysOnTop);
         setUiPrefs(nextUiPrefs);
+        setDailyHeatmapDays(nextHeatmap);
       } catch (error) {
         if (active) {
           setErrorMessage(toErrorMessage(error));
@@ -472,6 +695,10 @@ function App() {
       active = false;
       if (undoTimer.current !== null) {
         window.clearTimeout(undoTimer.current);
+      }
+      if (midnightReminderTimer.current !== null) {
+        window.clearTimeout(midnightReminderTimer.current);
+        midnightReminderTimer.current = null;
       }
       for (const timer of finishFxTimers.current.values()) {
         window.clearTimeout(timer);
@@ -511,6 +738,37 @@ function App() {
     return () => window.clearTimeout(timer);
   }, [detailTitle, detailNote, selectedTodo]);
 
+  useEffect(() => {
+    if (loading) {
+      return;
+    }
+
+    void runDailyReminderCheck();
+    scheduleNextMidnightReminderCheck();
+
+    const onFocus = () => {
+      void runDailyReminderCheck();
+    };
+
+    const onVisibilityChange = () => {
+      if (document.visibilityState === 'visible') {
+        void runDailyReminderCheck();
+      }
+    };
+
+    window.addEventListener('focus', onFocus);
+    document.addEventListener('visibilitychange', onVisibilityChange);
+
+    return () => {
+      window.removeEventListener('focus', onFocus);
+      document.removeEventListener('visibilitychange', onVisibilityChange);
+      if (midnightReminderTimer.current !== null) {
+        window.clearTimeout(midnightReminderTimer.current);
+        midnightReminderTimer.current = null;
+      }
+    };
+  }, [loading]);
+
   async function refreshTodos(preferredId?: string | null) {
     const nextTodos = await listTodos();
     setTodos(nextTodos);
@@ -523,6 +781,98 @@ function App() {
 
       return nextTodos[0]?.id ?? null;
     });
+  }
+
+  async function refreshDailyHeatmap() {
+    try {
+      const nextHeatmap = await getDailyCompletionHeatmap(DAILY_HEATMAP_DAYS);
+      setDailyHeatmapDays(nextHeatmap);
+    } catch (error) {
+      setErrorMessage(toErrorMessage(error));
+    }
+  }
+
+  async function ensureNotificationPermission(): Promise<NotificationPermission | null> {
+    if (typeof window === 'undefined' || !('Notification' in window)) {
+      return null;
+    }
+
+    let permission = Notification.permission;
+    if (permission === 'default') {
+      try {
+        permission = await Notification.requestPermission();
+      } catch {
+        return null;
+      }
+    }
+
+    return permission;
+  }
+
+  async function showDueReminderNotification(reminders: DueReminder[]) {
+    if (reminders.length === 0 || typeof window === 'undefined' || !('Notification' in window)) {
+      return;
+    }
+
+    const message = buildReminderNotification(reminders);
+    const notification = new Notification(message.title, {
+      body: message.body,
+      tag: `simple-todo-day-reminder-${toLocalDateKey(new Date())}`,
+    });
+
+    notification.onclick = () => {
+      window.focus();
+      const firstReminder = reminders[0];
+      if (firstReminder) {
+        setSelectedTodoId(firstReminder.id);
+        if (activeSizeClassRef.current === 'mini') {
+          void switchSizeClass('standard');
+        }
+      }
+      notification.close();
+    };
+  }
+
+  async function runDailyReminderCheck() {
+    if (reminderCheckInFlight.current) {
+      return;
+    }
+
+    reminderCheckInFlight.current = true;
+
+    try {
+      const permission = await ensureNotificationPermission();
+      if (permission !== 'granted') {
+        return;
+      }
+
+      const reminders = await consumeDailyDueReminders();
+      if (reminders.length > 0) {
+        await showDueReminderNotification(reminders);
+      }
+    } catch (error) {
+      setErrorMessage(toErrorMessage(error));
+    } finally {
+      reminderCheckInFlight.current = false;
+    }
+  }
+
+  function scheduleNextMidnightReminderCheck() {
+    if (midnightReminderTimer.current !== null) {
+      window.clearTimeout(midnightReminderTimer.current);
+      midnightReminderTimer.current = null;
+    }
+
+    const now = new Date();
+    const nextMidnight = new Date(now);
+    nextMidnight.setHours(24, 0, 2, 0);
+    const delayMs = Math.max(1000, nextMidnight.getTime() - now.getTime());
+
+    midnightReminderTimer.current = window.setTimeout(() => {
+      midnightReminderTimer.current = null;
+      void runDailyReminderCheck();
+      scheduleNextMidnightReminderCheck();
+    }, delayMs);
   }
 
   async function addTodo(event: FormEvent) {
@@ -573,6 +923,7 @@ function App() {
       note?: string;
       completed?: boolean;
       dueDate?: string | null;
+      reminderEnabled?: boolean;
     } = { id: todoId };
 
     if ('title' in patch) {
@@ -593,6 +944,10 @@ function App() {
 
     if ('dueDate' in patch) {
       payload.dueDate = patch.dueDate ?? null;
+    }
+
+    if ('reminderEnabled' in patch) {
+      payload.reminderEnabled = patch.reminderEnabled;
     }
 
     try {
@@ -652,6 +1007,9 @@ function App() {
     try {
       const updated = await setRecurrenceCheckRecord(todoId, checked);
       setTodos((previous) => previous.map((todo) => (todo.id === todoId ? updated : todo)));
+      if (target.recurrenceTag === 'daily') {
+        void refreshDailyHeatmap();
+      }
       setErrorMessage(null);
     } catch (error) {
       setErrorMessage(toErrorMessage(error));
@@ -932,6 +1290,7 @@ function App() {
               const cycleChecked = isRecurringCycleChecked(todo);
               const recurringOpen = isRecurringTag(todo.recurrenceTag) && !todo.completed;
               const isFinishing = finishingTodoIds.includes(todo.id);
+              const urgencyLevel = getTodoUrgency(todo);
 
               return (
                 <li key={todo.id}>
@@ -939,6 +1298,7 @@ function App() {
                     role="button"
                     tabIndex={0}
                     className={`todo-item ${selectedTodoId === todo.id ? 'selected' : ''} ${isFinishing ? 'finish-fx' : ''}`}
+                    data-urgency={urgencyLevel}
                     onClick={() => void handleChecklistToggle(todo)}
                     onKeyDown={(event) => {
                       if (event.key === 'Enter' || event.key === ' ') {
@@ -985,6 +1345,51 @@ function App() {
 
         {sizeClass !== 'mini' && (
           <article className="detail-panel">
+            <section className="heatmap-card" aria-label="Daily completion heatmap">
+              <div className="heatmap-head">
+                <p>Daily completion map</p>
+                <span>Last {DAILY_HEATMAP_DAYS} days</span>
+              </div>
+
+              <div
+                className="heatmap-grid"
+                role="img"
+                aria-label={`GitHub-style map of daily task completions over the last ${DAILY_HEATMAP_DAYS} days.`}
+              >
+                {dailyHeatmap.weeks.map((week, weekIndex) => (
+                  <div key={`week-${weekIndex}`} className="heatmap-week">
+                    {HEATMAP_ROW_ORDER.map((row) => {
+                      const cell = week[row] ?? null;
+                      if (!cell) {
+                        return <span key={`week-${weekIndex}-row-${row}`} className="heatmap-cell is-empty" aria-hidden="true" />;
+                      }
+
+                      return (
+                        <span
+                          key={cell.date}
+                          className={`heatmap-cell level-${cell.level}${cell.isToday ? ' is-today' : ''}`}
+                          title={cell.label}
+                        />
+                      );
+                    })}
+                  </div>
+                ))}
+              </div>
+
+              <div className="heatmap-legend" aria-hidden="true">
+                <span>Less</span>
+                <span className="heatmap-cell level-0" />
+                <span className="heatmap-cell level-1" />
+                <span className="heatmap-cell level-2" />
+                <span className="heatmap-cell level-3" />
+                <span className="heatmap-cell level-4" />
+                <span>More</span>
+              </div>
+              <p className="heatmap-caption">
+                Peak day: {dailyHeatmap.maxCount} completion{dailyHeatmap.maxCount === 1 ? '' : 's'}.
+              </p>
+            </section>
+
             {selectedTodo ? (
               <>
                 <div className="detail-header">
@@ -1029,6 +1434,28 @@ function App() {
                       })
                     }
                   />
+                </div>
+
+                <div className="field-row">
+                  <label htmlFor="reminder-toggle">Reminder</label>
+                  <div className="status-cell">
+                    <button
+                      id="reminder-toggle"
+                      type="button"
+                      className={`status-toggle ${selectedTodo.reminderEnabled ? 'is-on' : ''}`}
+                      onClick={() =>
+                        void applyTodoPatch(selectedTodo.id, {
+                          reminderEnabled: !selectedTodo.reminderEnabled,
+                        })
+                      }
+                    >
+                      {selectedTodo.reminderEnabled ? 'Daily reminders on' : 'Daily reminders off'}
+                    </button>
+                    <p className="status-hint">
+                      Once per day for due or overdue tasks while the app is running
+                      {selectedTodo.dueDate ? '.' : ' (set a due date to activate).'}
+                    </p>
+                  </div>
                 </div>
 
                 <div className="field-row">

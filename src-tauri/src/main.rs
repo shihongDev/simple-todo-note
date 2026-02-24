@@ -2,7 +2,7 @@
 
 use std::sync::Mutex;
 
-use chrono::Utc;
+use chrono::{DateTime, Duration, Local, NaiveDate, Utc};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, LogicalPosition, LogicalSize, Manager, Position, Size, State, WebviewWindow, WindowEvent};
@@ -40,6 +40,9 @@ struct Todo {
   due_date: Option<String>,
   created_at: String,
   updated_at: String,
+  reminder_enabled: bool,
+  #[serde(skip_serializing, skip_deserializing)]
+  last_reminded_on: Option<String>,
   #[serde(skip_serializing, skip_deserializing)]
   sort_order: i64,
 }
@@ -62,6 +65,7 @@ struct UpdateTodoInput {
   note: Option<String>,
   completed: Option<bool>,
   due_date: Option<Option<String>>,
+  reminder_enabled: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -83,6 +87,23 @@ struct LegacyTodo {
 struct MigrationResult {
   migrated_count: usize,
   already_migrated: bool,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DailyCompletionHeatmapDay {
+  date: String,
+  count: u32,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DueReminder {
+  id: String,
+  title: String,
+  due_date: String,
+  days_overdue: i64,
+  recurrence_tag: String,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -183,6 +204,50 @@ fn now_iso() -> String {
   Utc::now().to_rfc3339()
 }
 
+fn local_day_key() -> String {
+  Local::now().format("%Y-%m-%d").to_string()
+}
+
+fn local_today_naive() -> NaiveDate {
+  Local::now().date_naive()
+}
+
+fn parse_iso_to_local_datetime(value: &str) -> Option<DateTime<Local>> {
+  DateTime::parse_from_rfc3339(value)
+    .ok()
+    .map(|parsed| parsed.with_timezone(&Local))
+}
+
+fn is_recurrence_cycle_checked_at(recurrence_tag: &str, recurrence_checked_at: Option<&str>) -> bool {
+  if recurrence_tag == RECURRENCE_NONE {
+    return false;
+  }
+
+  let Some(raw_checked_at) = recurrence_checked_at else {
+    return false;
+  };
+
+  let Some(checked_at) = parse_iso_to_local_datetime(raw_checked_at) else {
+    return false;
+  };
+
+  let now = Local::now();
+
+  match recurrence_tag {
+    RECURRENCE_DAILY => checked_at.date_naive() == now.date_naive(),
+    RECURRENCE_WEEKLY | RECURRENCE_BI_WEEKLY => {
+      let elapsed = now.signed_duration_since(checked_at);
+      if elapsed < Duration::zero() {
+        return false;
+      }
+
+      let cycle_days = if recurrence_tag == RECURRENCE_WEEKLY { 7 } else { 14 };
+      elapsed < Duration::days(cycle_days)
+    }
+    _ => false,
+  }
+}
+
 fn normalize_date(value: Option<String>) -> Option<String> {
   value.and_then(|candidate| {
     let trimmed = candidate.trim();
@@ -268,7 +333,9 @@ fn map_todo_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Todo> {
     due_date: row.get(6)?,
     created_at: row.get(7)?,
     updated_at: row.get(8)?,
-    sort_order: row.get(9)?,
+    reminder_enabled: row.get::<_, i64>(9)? != 0,
+    last_reminded_on: row.get(10)?,
+    sort_order: row.get(11)?,
   })
 }
 
@@ -284,6 +351,8 @@ fn ensure_schema(conn: &Connection) -> CommandResult<()> {
         note TEXT NOT NULL DEFAULT '',
         completed INTEGER NOT NULL DEFAULT 0,
         due_date TEXT NULL,
+        reminder_enabled INTEGER NOT NULL DEFAULT 1,
+        last_reminded_on TEXT NULL,
         sort_order INTEGER NOT NULL,
         created_at TEXT NOT NULL,
         updated_at TEXT NOT NULL
@@ -294,8 +363,17 @@ fn ensure_schema(conn: &Connection) -> CommandResult<()> {
         value TEXT NOT NULL
       );
 
+      CREATE TABLE IF NOT EXISTS daily_completion_events (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        todo_id TEXT NOT NULL,
+        event_day TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        UNIQUE(todo_id, event_day)
+      );
+
       CREATE INDEX IF NOT EXISTS idx_todos_sort_order ON todos(sort_order);
       CREATE INDEX IF NOT EXISTS idx_todos_completed_sort ON todos(completed, sort_order);
+      CREATE INDEX IF NOT EXISTS idx_daily_completion_event_day ON daily_completion_events(event_day);
     "#,
     )
     .map_err(|err| err.to_string())?;
@@ -317,13 +395,30 @@ fn ensure_schema(conn: &Connection) -> CommandResult<()> {
     }
   }
 
+  if let Err(err) = conn.execute(
+    "ALTER TABLE todos ADD COLUMN reminder_enabled INTEGER NOT NULL DEFAULT 1",
+    [],
+  ) {
+    let message = err.to_string();
+    if !message.contains("duplicate column name") {
+      return Err(message);
+    }
+  }
+
+  if let Err(err) = conn.execute("ALTER TABLE todos ADD COLUMN last_reminded_on TEXT NULL", []) {
+    let message = err.to_string();
+    if !message.contains("duplicate column name") {
+      return Err(message);
+    }
+  }
+
   Ok(())
 }
 
 fn get_todo_by_id(conn: &Connection, id: &str) -> CommandResult<Option<Todo>> {
   conn
     .query_row(
-      "SELECT id, title, recurrence_tag, recurrence_checked_at, note, completed, due_date, created_at, updated_at, sort_order
+      "SELECT id, title, recurrence_tag, recurrence_checked_at, note, completed, due_date, created_at, updated_at, reminder_enabled, last_reminded_on, sort_order
        FROM todos WHERE id = ?1",
       params![id],
       map_todo_row,
@@ -491,7 +586,7 @@ fn list_todos(state: State<'_, AppState>) -> CommandResult<Vec<Todo>> {
 
   let mut statement = conn
     .prepare(
-      "SELECT id, title, recurrence_tag, recurrence_checked_at, note, completed, due_date, created_at, updated_at, sort_order
+      "SELECT id, title, recurrence_tag, recurrence_checked_at, note, completed, due_date, created_at, updated_at, reminder_enabled, last_reminded_on, sort_order
        FROM todos ORDER BY sort_order ASC, created_at DESC",
     )
     .map_err(|err| err.to_string())?;
@@ -539,14 +634,16 @@ fn create_todo(state: State<'_, AppState>, input: CreateTodoInput) -> CommandRes
     due_date: normalize_date(input.due_date),
     created_at: now.clone(),
     updated_at: now,
+    reminder_enabled: true,
+    last_reminded_on: None,
     sort_order,
   };
 
   conn
     .execute(
       "INSERT INTO todos
-       (id, title, recurrence_tag, recurrence_checked_at, note, completed, due_date, sort_order, created_at, updated_at)
-       VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+       (id, title, recurrence_tag, recurrence_checked_at, note, completed, due_date, reminder_enabled, last_reminded_on, sort_order, created_at, updated_at)
+       VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
       params![
         &todo.id,
         &todo.title,
@@ -555,6 +652,8 @@ fn create_todo(state: State<'_, AppState>, input: CreateTodoInput) -> CommandRes
         &todo.note,
         to_db_bool(todo.completed),
         &todo.due_date,
+        to_db_bool(todo.reminder_enabled),
+        &todo.last_reminded_on,
         todo.sort_order,
         &todo.created_at,
         &todo.updated_at,
@@ -601,12 +700,16 @@ fn update_todo(state: State<'_, AppState>, input: UpdateTodoInput) -> CommandRes
     updated.due_date = normalize_date(due_date);
   }
 
+  if let Some(reminder_enabled) = input.reminder_enabled {
+    updated.reminder_enabled = reminder_enabled;
+  }
+
   updated.updated_at = now_iso();
 
   conn
     .execute(
       "UPDATE todos
-       SET title = ?2, recurrence_tag = ?3, note = ?4, completed = ?5, due_date = ?6, updated_at = ?7
+       SET title = ?2, recurrence_tag = ?3, note = ?4, completed = ?5, due_date = ?6, updated_at = ?7, reminder_enabled = ?8
        WHERE id = ?1",
       params![
         &updated.id,
@@ -616,6 +719,7 @@ fn update_todo(state: State<'_, AppState>, input: UpdateTodoInput) -> CommandRes
         to_db_bool(updated.completed),
         &updated.due_date,
         &updated.updated_at,
+        to_db_bool(updated.reminder_enabled),
       ],
     )
     .map_err(|err| err.to_string())?;
@@ -646,7 +750,7 @@ fn toggle_todo(state: State<'_, AppState>, id: String) -> CommandResult<Todo> {
 
 #[tauri::command]
 fn set_recurrence_check(state: State<'_, AppState>, id: String, checked: bool) -> CommandResult<Todo> {
-  let conn = state
+  let mut conn = state
     .db
     .lock()
     .map_err(|_| "Failed to acquire database lock".to_string())?;
@@ -660,14 +764,169 @@ fn set_recurrence_check(state: State<'_, AppState>, id: String, checked: bool) -
   target.recurrence_checked_at = if checked { Some(now_iso()) } else { None };
   target.updated_at = now_iso();
 
-  conn
+  let tx = conn.transaction().map_err(|err| err.to_string())?;
+
+  tx
     .execute(
       "UPDATE todos SET recurrence_checked_at = ?2, updated_at = ?3 WHERE id = ?1",
       params![&target.id, &target.recurrence_checked_at, &target.updated_at],
     )
     .map_err(|err| err.to_string())?;
 
+  if target.recurrence_tag == RECURRENCE_DAILY {
+    let event_day = local_day_key();
+
+    if checked {
+      tx
+        .execute(
+          "INSERT INTO daily_completion_events (todo_id, event_day, created_at)
+           VALUES (?1, ?2, ?3)
+           ON CONFLICT(todo_id, event_day) DO NOTHING",
+          params![&target.id, &event_day, &target.updated_at],
+        )
+        .map_err(|err| err.to_string())?;
+    } else {
+      tx
+        .execute(
+          "DELETE FROM daily_completion_events
+           WHERE todo_id = ?1 AND event_day = ?2",
+          params![&target.id, &event_day],
+        )
+        .map_err(|err| err.to_string())?;
+    }
+  }
+
+  tx.commit().map_err(|err| err.to_string())?;
+
   Ok(target)
+}
+
+#[tauri::command]
+fn get_daily_completion_heatmap(
+  state: State<'_, AppState>,
+  days: u16,
+) -> CommandResult<Vec<DailyCompletionHeatmapDay>> {
+  let conn = state
+    .db
+    .lock()
+    .map_err(|_| "Failed to acquire database lock".to_string())?;
+
+  let clamped_days = days.clamp(1, 365) as i64;
+  let end_day = Local::now().date_naive();
+  let start_day = end_day - Duration::days(clamped_days - 1);
+  let start_key = start_day.format("%Y-%m-%d").to_string();
+  let end_key = end_day.format("%Y-%m-%d").to_string();
+
+  let mut statement = conn
+    .prepare(
+      "SELECT event_day, COUNT(*) AS completion_count
+       FROM daily_completion_events
+       WHERE event_day >= ?1 AND event_day <= ?2
+       GROUP BY event_day
+       ORDER BY event_day ASC",
+    )
+    .map_err(|err| err.to_string())?;
+
+  let rows = statement
+    .query_map(params![start_key, end_key], |row| {
+      let count: i64 = row.get(1)?;
+
+      Ok(DailyCompletionHeatmapDay {
+        date: row.get(0)?,
+        count: if count < 0 { 0 } else { count as u32 },
+      })
+    })
+    .map_err(|err| err.to_string())?;
+
+  let mut output = Vec::new();
+  for row in rows {
+    output.push(row.map_err(|err| err.to_string())?);
+  }
+
+  Ok(output)
+}
+
+#[tauri::command]
+fn consume_daily_due_reminders(state: State<'_, AppState>) -> CommandResult<Vec<DueReminder>> {
+  let mut conn = state
+    .db
+    .lock()
+    .map_err(|_| "Failed to acquire database lock".to_string())?;
+
+  let today = local_today_naive();
+  let today_key = today.format("%Y-%m-%d").to_string();
+  let tx = conn.transaction().map_err(|err| err.to_string())?;
+
+  let mut statement = tx
+    .prepare(
+      "SELECT id, title, due_date, recurrence_tag, recurrence_checked_at
+       FROM todos
+       WHERE reminder_enabled = 1
+         AND completed = 0
+         AND due_date IS NOT NULL
+         AND due_date <= ?1
+         AND (last_reminded_on IS NULL OR last_reminded_on <> ?1)
+       ORDER BY due_date ASC, sort_order ASC, created_at DESC",
+    )
+    .map_err(|err| err.to_string())?;
+
+  let rows = statement
+    .query_map(params![&today_key], |row| {
+      let id: String = row.get(0)?;
+      let title: String = row.get(1)?;
+      let due_date: String = row.get(2)?;
+      let recurrence_tag: String = row.get(3)?;
+      let recurrence_checked_at: Option<String> = row.get(4)?;
+
+      Ok((id, title, due_date, recurrence_tag, recurrence_checked_at))
+    })
+    .map_err(|err| err.to_string())?;
+
+  let mut reminders = Vec::new();
+  let mut reminder_ids = Vec::new();
+
+  for row in rows {
+    let (id, title, due_date, recurrence_tag, recurrence_checked_at) =
+      row.map_err(|err| err.to_string())?;
+
+    if is_recurrence_cycle_checked_at(&recurrence_tag, recurrence_checked_at.as_deref()) {
+      continue;
+    }
+
+    let due_day = match NaiveDate::parse_from_str(&due_date, "%Y-%m-%d") {
+      Ok(day) => day,
+      Err(_) => continue,
+    };
+
+    let days_overdue = today.signed_duration_since(due_day).num_days();
+    if days_overdue < 0 {
+      continue;
+    }
+
+    reminder_ids.push(id.clone());
+    reminders.push(DueReminder {
+      id,
+      title,
+      due_date,
+      days_overdue,
+      recurrence_tag,
+    });
+  }
+
+  drop(statement);
+
+  for id in &reminder_ids {
+    tx
+      .execute(
+        "UPDATE todos SET last_reminded_on = ?2 WHERE id = ?1",
+        params![id, &today_key],
+      )
+      .map_err(|err| err.to_string())?;
+  }
+
+  tx.commit().map_err(|err| err.to_string())?;
+
+  Ok(reminders)
 }
 
 #[tauri::command]
@@ -945,6 +1204,8 @@ fn main() {
       update_todo,
       toggle_todo,
       set_recurrence_check,
+      get_daily_completion_heatmap,
+      consume_daily_due_reminders,
       delete_todo,
       reorder_todos,
       migrate_legacy_todos_if_needed,

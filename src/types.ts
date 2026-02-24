@@ -16,11 +16,12 @@ export type Todo = {
   note: string;
   completed: boolean;
   dueDate: string | null;
+  reminderEnabled: boolean;
   createdAt: string;
   updatedAt: string;
 };
 
-export type LegacyTodo = Omit<Todo, 'recurrenceTag' | 'recurrenceCheckedAt'> & {
+export type LegacyTodo = Omit<Todo, 'recurrenceTag' | 'recurrenceCheckedAt' | 'reminderEnabled'> & {
   recurrenceTag?: RecurrenceTag;
   recurrenceCheckedAt?: string | null;
 };
@@ -39,6 +40,7 @@ export type UpdateTodoInput = {
   note?: string;
   completed?: boolean;
   dueDate?: string | null;
+  reminderEnabled?: boolean;
 };
 
 export type MigrationResult = {
@@ -65,4 +67,17 @@ export type UiPrefs = {
 export type DeletedSnapshot = {
   todo: Todo;
   index: number;
+};
+
+export type DailyHeatmapDay = {
+  date: string;
+  count: number;
+};
+
+export type DueReminder = {
+  id: string;
+  title: string;
+  dueDate: string;
+  daysOverdue: number;
+  recurrenceTag: RecurrenceTag;
 };
